@@ -3,8 +3,8 @@ import base64, io, json, sys, csv
 from pathlib import Path
 from PIL import Image
 from PySide6.QtCore import Qt, QRect, QTimer
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QIcon, QKeySequence
-from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QHBoxLayout,QVBoxLayout,QPushButton,QLabel,QListWidget,QFileDialog,QMessageBox,QComboBox,QSpinBox,QDoubleSpinBox,QFormLayout,QInputDialog,QTabWidget,QColorDialog,QLineEdit,QCheckBox,QScrollArea,QSlider,QTableWidget,QTableWidgetItem,QHeaderView,QDockWidget,QSizePolicy,QGroupBox,QShortcut)
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QIcon, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QHBoxLayout,QVBoxLayout,QPushButton,QLabel,QListWidget,QFileDialog,QMessageBox,QComboBox,QSpinBox,QDoubleSpinBox,QFormLayout,QInputDialog,QTabWidget,QColorDialog,QLineEdit,QCheckBox,QScrollArea,QSlider,QTableWidget,QTableWidgetItem,QHeaderView,QDockWidget,QSizePolicy,QGroupBox)
 from .history import UndoHistory, capture, decode, atomic_write
 from .worksheet import NFTWorksheet
 from .core import Layer,Region,EFFECTS,composite,transformed,paint_pixel,frames_for,compose_timeline_frames,export_apng,export_gif,export_sprite_sheet,generate_traits
