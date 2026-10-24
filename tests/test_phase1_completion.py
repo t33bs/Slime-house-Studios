@@ -5,7 +5,7 @@ class PhaseOneCompletion(unittest.TestCase):
     def test_only_three_studios(self):
         self.assertIn('Open Junior Animator',APP)
         self.assertIn('Open Intermediate Studio',APP)
-        self.assertIn('Open Desktop Pet Builder',APP)
+        self.assertIn('Legacy Desktop Pet Builder (retired)',APP)
         self.assertNotIn('Senior Animator',APP)
     def test_visual_pose_anchors(self):
         for term in ('Pose Anchor','place_anchor','show_pet_anchors','pet_anchors'):

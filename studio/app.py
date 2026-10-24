@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QHBoxLayout,QVBo
 from .pet_sprite_wizard import ANIMATIONS, LIFE_ANIMATIONS, BATTLE_ANIMATIONS, POSE_TEMPLATES, generate as generate_pet_animations, export_package as export_pet_package, animation_guide, format_animation_guide, export_animation_guides, generate_rigged, validate_regions, RIG_PARTS
 from .history import UndoHistory, capture, decode, atomic_write
 from .worksheet import NFTWorksheet
+from .bucket_fill import flood_fill
 from .core import Layer,Region,EFFECTS,composite,transformed,paint_pixel,frames_for,compose_timeline_frames,apply_motion_keyframes,paste_clip,compose_layer_motion_frames,interpolate_pose_anchors,export_apng,export_gif,export_sprite_sheet,generate_traits
 
 def resource_path(p):return Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent.parent))/p
@@ -18,11 +19,11 @@ def qimage(im):
 # Tiny high-contrast tool cursors, drawn locally so the EXE needs no extra assets.
 # The small crosshair is the exact canvas interaction point (hotspot 3,3).
 CURSOR_SYMBOLS={
-    'Pencil':'✎','Eraser':'⌫','Mask Brush':'✦','Mask Eraser':'◇',
+    'Paint Bucket':'▨','Pencil':'✎','Eraser':'⌫','Mask Brush':'✦','Mask Eraser':'◇',
     'Frame Pencil':'✎','Frame Eraser':'⌫','Pet Region Select':'▭','Eyedropper':'◉','Animation Region':'▭','Pose Anchor':'⌖',
 }
 CURSOR_COLORS={
-    'Pencil':'#ffe3a1','Eraser':'#ffb6b6','Mask Brush':'#91e6bb',
+    'Paint Bucket':'#a8f5d0','Pencil':'#ffe3a1','Eraser':'#ffb6b6','Mask Brush':'#91e6bb',
     'Mask Eraser':'#a7d3ff','Frame Pencil':'#f5cf9c',
     'Frame Eraser':'#ffb9bd','Pet Region Select':'#7de4b3','Eyedropper':'#c4b5fd','Animation Region':'#d5bbef','Pose Anchor':'#ffdc8b',
 }
@@ -53,7 +54,7 @@ def cursor_for_tool(tool):
 
 class Canvas(QWidget):
     def __init__(self,main):
-        super().__init__();self.main=main;self.setMinimumSize(450,450);self.drag=None;self.setMouseTracking(True);self.zoom_factor=1.0;self.zoom_focus=None
+        super().__init__();self.main=main;self.setMinimumSize(260,260);self.drag=None;self.setMouseTracking(True);self.zoom_factor=1.0;self.zoom_focus=None
     def coord(self,pos):return round((pos.x()-self.ox)/self.zoom),round((pos.y()-self.oy)/self.zoom)
     def rect_screen(self,rect):
         x,y,w,h=rect;return QRect(round(self.ox+x*self.zoom),round(self.oy+y*self.zoom),max(1,round(w*self.zoom)),max(1,round(h*self.zoom)))
@@ -145,6 +146,16 @@ class Canvas(QWidget):
             m.checkpoint();self.drag=['right-erase',context]
             self.erase_at(x,y,context)
             e.accept();return
+        if tool=='Paint Bucket':
+            if not (0<=x<m.size_px[0] and 0<=y<m.size_px[1]):return
+            if l is None:
+                m.statusBar().showMessage('Select a paint layer before filling.',3500);return
+            if l.angle%360 or l.scale!=1:
+                m.statusBar().showMessage('Bucket fill requires layer scale 100% and rotation 0°.',3500);return
+            filled=flood_fill(l.image,(x-l.x,y-l.y),m.paint_color)
+            if filled is not None:
+                m.checkpoint();l.image=filled;m.invalidate()
+            return
         if tool=='Pet Region Select':
             if m.pet_template_path.text().strip():
                 m.statusBar().showMessage('Clear the separate template path to select regions on the canvas.',4000);return
@@ -303,6 +314,7 @@ class MainWindow(QMainWindow):
         root=QWidget();self.setCentralWidget(root);layout=QHBoxLayout(root)
         # Avoid Qt animated dock relayout during maximize/restore on Windows.
         self.setDockOptions(QMainWindow.DockOption.AllowTabbedDocks)
+        self.setMinimumSize(640,480)
         self.setAnimated(False)
         self.setup_classic_menus()
         left=QWidget();lv=QVBoxLayout(left);left.setMaximumWidth(285);layout.addWidget(left)
@@ -316,15 +328,16 @@ class MainWindow(QMainWindow):
         for text,fn in [('↑',lambda:self.move_layer(1)),('↓',lambda:self.move_layer(-1)),('Delete',self.remove_layer)]:
             b=QPushButton(text);b.clicked.connect(fn);bar.addWidget(b)
         lv.addWidget(QLabel('YOUR ACTIVE TOOL'))
-        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Pencil','Eraser','Eyedropper','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser','Pose Anchor','Pet Region Select']);lv.addWidget(self.tool)
+        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Pencil','Paint Bucket','Eraser','Eyedropper','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser','Pose Anchor','Pet Region Select']);lv.addWidget(self.tool)
         self.active_tool_banner=QLabel('↔  Move / Transform  ·  Drag artwork to move it')
         self.active_tool_banner.setObjectName('activeToolBanner')
         self.active_tool_banner.setWordWrap(True)
         lv.addWidget(self.active_tool_banner)
         self.animator_button=QPushButton('✨ Open Junior Animator');self.animator_button.setToolTip('Quick effects for funny moving sprites and NFTs');lv.addWidget(self.animator_button)
         self.advanced_animator_button=QPushButton('🎞 Open Intermediate Studio');self.advanced_animator_button.setToolTip('Frame-by-frame timeline for longer animations and GIFs');lv.addWidget(self.advanced_animator_button)
-        self.pet_workshop_button=QPushButton('🐾 Open Desktop Pet Builder')
-        lv.addWidget(self.pet_workshop_button)
+        # Legacy Desktop Pet Builder is retired from the Studio interface.
+        self.pet_workshop_button=QPushButton('Legacy Desktop Pet Builder (retired)')
+        self.pet_workshop_button.hide()
         self.guided_toggle=QCheckBox('💡 Guided Mode — show beginner tips')
         self.guided_toggle.setChecked(self.settings.value('guided_mode',True,type=bool))
         self.guided_toggle.toggled.connect(self.update_guided_mode)
@@ -332,7 +345,17 @@ class MainWindow(QMainWindow):
         self.nft_manager_button=QPushButton('🐱 Open NFT Manager')
         self.nft_manager_button.setToolTip('Optional NFT worksheet and trait tools — hide this for a clean pixel-art workspace.')
         lv.addWidget(self.nft_manager_button)
-        color=QPushButton('Choose brush color');color.clicked.connect(self.choose_color);lv.addWidget(color)
+        # Keep color choices above the workshop difficulty/guidance options.
+        color=QPushButton('Choose brush color');color.clicked.connect(self.choose_color)
+        lv.insertWidget(lv.indexOf(self.guided_toggle),color)
+        palette=QWidget();palette_row=QHBoxLayout(palette);palette_row.setContentsMargins(0,0,0,0)
+        for hex_color in ('#111827','#FFFFFF','#F4B5A5','#FFD166','#77F5A0','#52C7FF','#BB83FF','#FF76C8'):
+            swatch=QPushButton('');swatch.setFixedSize(24,24)
+            swatch.setToolTip(hex_color)
+            swatch.setStyleSheet('background:'+hex_color+';border:1px solid #8ba6a0;border-radius:3px;')
+            swatch.clicked.connect(lambda checked=False,c=hex_color:self.set_brush_hex(c))
+            palette_row.addWidget(swatch)
+        lv.insertWidget(lv.indexOf(self.guided_toggle),palette)
         self.brush=QSpinBox();self.brush.setRange(1,32);self.brush.setValue(1)
         self.x=QSpinBox();self.y=QSpinBox();self.scale=QDoubleSpinBox();self.angle=QDoubleSpinBox()
         for s in (self.x,self.y):s.setRange(-4096,4096)
@@ -342,7 +365,7 @@ class MainWindow(QMainWindow):
         for name,spin in [('Brush (px)',self.brush),('Layer X',self.x),('Layer Y',self.y),('Scale',self.scale),('Rotation °',self.angle)]:form.addRow(name,spin)
         for spin in (self.x,self.y,self.scale,self.angle):spin.valueChanged.connect(self.apply_layer_controls)
         self.canvas=Canvas(self);layout.addWidget(self.canvas,1)
-        self.tabs=QTabWidget();self.tabs.setMinimumWidth(315);self.tabs.setMaximumWidth(395);layout.addWidget(self.tabs)
+        self.tabs=QTabWidget();self.tabs.setMinimumWidth(240);self.tabs.setMaximumWidth(395);layout.addWidget(self.tabs)
         self.animator_dock=QDockWidget('Junior Animator — Quick Effects',self)
         self.animator_dock.setObjectName('JuniorAnimatorDock')
         self.animator_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.BottomDockWidgetArea)
@@ -770,6 +793,12 @@ class MainWindow(QMainWindow):
         self.advanced_animator_dock.hide()
         self.nft_manager_dock.hide()
         self.pet_workshop_dock.hide()
+        # Remove the retired dock from Qt's main-window layout entirely.
+        # This also prevents its hidden size hints from affecting maximize/restore.
+        self.removeDockWidget(self.pet_workshop_dock)
+        self.pet_workshop_dock.setParent(None)
+        self.pet_workshop_dock.deleteLater()
+        self.pet_workshop_dock=None
         self.install_beginner_helpers()
         self.update_guided_mode(self.guided_toggle.isChecked())
         self.activate_tool(self.tool.currentText())
@@ -983,7 +1012,13 @@ class MainWindow(QMainWindow):
         self.pet_help.setVisible(enabled)
         self.statusBar().showMessage('Guided Mode on — tool tips are visible' if enabled else 'Guided Mode off — compact workspace',3500)
 
+    def set_brush_hex(self,hex_color):
+        c=QColor(hex_color)
+        self.paint_color=(c.red(),c.green(),c.blue(),255)
+        self.statusBar().showMessage('Brush color: '+hex_color,2500)
+
     def toggle_pet_workshop(self):
+        if self.pet_workshop_dock is None:return
         if self.pet_workshop_dock.isVisible():self.pet_workshop_dock.hide()
         else:self.pet_workshop_dock.show();self.pet_workshop_dock.raise_()
 
@@ -1143,7 +1178,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self,'Sprite sheet export failed',str(exc))
 
     def pet_workshop_visibility_changed(self,visible):
-        self.pet_workshop_button.setText('🐾 Hide Desktop Pet Builder' if visible else '🐾 Open Desktop Pet Builder')
+        # Legacy builder retired; no user-facing button to update.
+        return
 
     def reset_layer_mesh(self):
         layer=self.selected_layer()
@@ -1836,6 +1872,8 @@ class MainWindow(QMainWindow):
             state = ('maximized' if self.isMaximized() else
                      'minimized' if self.isMinimized() else 'normal')
             self._last_window_state = state
+            # Defer canvas redraw until Qt completes native window-state transitions.
+            QTimer.singleShot(0,self.canvas.update) if hasattr(self,'canvas') else None
             logging.getLogger('slimehouse').info('Main window state: %s', state)
 
     def closeEvent(self,event):
