@@ -128,3 +128,6 @@ Intermediate Studio now has movement keyframes (pixel-snapped interpolated whole
 
 ## v24 Phase 2 feature completion
 Intermediate Studio now includes independent per-layer pixel movement keyframes, a visual timeline marker strip, whole-sprite movement, reusable frame clips, and anchor interpolation preview for pose changes. The renderer composes moving layers before effects/paint, preserving the original layer positions. Anchor transitions preview alignment positions, not full pose morphing. Windows GUI and exported animation validation remain required before release.
+
+## v24 Windows CI encoding patch
+Tests now explicitly read source and JSON files using UTF-8, fixing Windows cp1252/charmap failures in GitHub Actions. No application features changed.

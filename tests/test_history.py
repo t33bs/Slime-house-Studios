@@ -27,7 +27,7 @@ class HistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'backup.json'
             atomic_write(path, {'size': [64, 64], 'layers': []})
-            self.assertEqual(json.loads(path.read_text())['size'], [64, 64])
+            self.assertEqual(json.loads(path.read_text(encoding='utf-8'))['size'], [64, 64])
             self.assertEqual(list(Path(directory).glob('*.tmp')), [])
 
     def test_reject_bad_dimensions(self):
