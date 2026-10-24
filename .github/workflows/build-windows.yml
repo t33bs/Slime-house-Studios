@@ -35,7 +35,22 @@ jobs:
         shell: pwsh
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed --name SlimeHouseStudios --icon assets/slime_house_studios.ico --add-data "assets;assets" --collect-all PySide6 main.py
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (Test-Path $iscc) {
+            & $iscc "installer.iss"
+          } else {
+            Write-Host "Inno Setup is not installed; skipping installer."
+          }
 
+      - name: Upload Windows EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: SlimeHouseStudios-Windows-Phase1-Test
+          path: dist/SlimeHouseStudios.exe
+          if-no-files-found: error
       - name: Upload Windows EXE
         uses: actions/upload-artifact@v4
         with:
