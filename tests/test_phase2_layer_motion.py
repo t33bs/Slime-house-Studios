@@ -24,6 +24,6 @@ class LayerMotionTests(unittest.TestCase):
         frames=interpolate_pose_anchors({'Idle':{'Sword':[0,0]},'Walk':{'Sword':[4,2]}},'Idle','Walk',3)
         self.assertEqual([f['Sword'] for f in frames],[[0,0],[2,1],[4,2]])
     def test_source_has_persistence_and_layer_remapping(self):
-        s=(Path(__file__).resolve().parents[1]/'studio/app.py').read_text()
+        s=(Path(__file__).resolve().parents[1]/'studio/app.py').read_text(encoding="utf-8")
         for term in ("obj['layer_motion_keys']","obj.get('layer_motion_keys',{})",'keys_i=self.layer_motion_keys.pop','self.layer_motion_keys={str(int(k)-'):
             self.assertIn(term,s)
