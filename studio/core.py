@@ -342,3 +342,82 @@ def compose_timeline_frames(layers, size, regions, count, edits=None):
             if 0 <= x < size[0] and 0 <= y < size[1] and len(rgba) == 4:
                 frame.putpixel((x, y), tuple(max(0, min(255, c)) for c in rgba))
     return frames
+
+
+def interpolate_offsets(keyframes, count):
+    """Linear pixel-snapped movement from numbered keyframes; no artwork mutation."""
+    anchors=sorted((int(k),int(v[0]),int(v[1])) for k,v in (keyframes or {}).items() if 0<=int(k)<count)
+    if not anchors:return [(0,0)]*count
+    result=[]
+    for i in range(count):
+        if i<=anchors[0][0]:result.append(anchors[0][1:]);continue
+        if i>=anchors[-1][0]:result.append(anchors[-1][1:]);continue
+        for a,b in zip(anchors,anchors[1:]):
+            if a[0]<=i<=b[0]:
+                t=(i-a[0])/(b[0]-a[0]);result.append((round(a[1]+(b[1]-a[1])*t),round(a[2]+(b[2]-a[2])*t)));break
+    return result
+
+
+def shift_frame(frame, dx, dy):
+    """Shift rendered RGBA pixels with transparent fill; keep original intact."""
+    out=Image.new('RGBA',frame.size)
+    out.paste(frame,(int(dx),int(dy)))
+    return out
+
+
+def apply_motion_keyframes(frames,keyframes):
+    return [shift_frame(frame,*offset) for frame,offset in zip(frames,interpolate_offsets(keyframes,len(frames)))]
+
+
+def paste_clip(track,clip,start,count):
+    """Paste a reusable frame-paint clip without mutating source or existing track."""
+    import copy
+    result=copy.deepcopy(track)
+    for relative,strokes in clip.items():
+        index=int(start)+int(relative)
+        if 0<=index<count:result[str(index)]=copy.deepcopy(strokes)
+    return result
+
+
+def compose_layer_motion_frames(layers,size,regions,count,edits=None,layer_keys=None,global_keys=None):
+    """Render independently moving layers before procedural effects and frame paint.
+
+    Layer keys are indexed by stable layer list positions. All transforms are
+    temporary; neither the artwork nor layer positions are modified.
+    """
+    import copy
+    layer_keys=layer_keys or {}
+    offsets={str(index):interpolate_offsets(keys,count) for index,keys in layer_keys.items()}
+    whole=interpolate_offsets(global_keys or {},count)
+    result=[]
+    for i in range(count):
+        moving=[]
+        for j,layer in enumerate(layers):
+            temporary=copy.copy(layer)
+            dx,dy=offsets.get(str(j),[(0,0)]*count)[i]
+            temporary.x+=dx;temporary.y+=dy
+            moving.append(temporary)
+        frame=composite(moving,size)
+        for region in regions or []:apply_region(frame,region,i,count)
+        for stroke in (edits or {}).get(str(i),[]):
+            x,y,*rgba=map(int,stroke)
+            if 0<=x<size[0] and 0<=y<size[1] and len(rgba)==4:
+                frame.putpixel((x,y),tuple(max(0,min(255,v)) for v in rgba))
+        result.append(shift_frame(frame,*whole[i]))
+    return result
+
+
+def interpolate_pose_anchors(poses,start_pose,end_pose,count):
+    """Interpolate matching named anchors, preserving unmatched names."""
+    if count<1:raise ValueError('Frame count must be positive')
+    a=poses.get(start_pose,{}) or {};b=poses.get(end_pose,{}) or {}
+    names=set(a)|set(b)
+    frames=[]
+    for i in range(count):
+        t=i/(count-1) if count>1 else 0
+        anchors={}
+        for name in names:
+            begin=a.get(name,b.get(name));end=b.get(name,begin)
+            anchors[name]=[round(begin[0]+(end[0]-begin[0])*t),round(begin[1]+(end[1]-begin[1])*t)]
+        frames.append(anchors)
+    return frames

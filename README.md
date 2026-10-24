@@ -101,3 +101,30 @@ Refined Junior Animator blinking, gentler breathing/twitch, white-core laser bea
 - GIF rejects frame times not divisible by 10 ms rather than silently changing the requested timing; choose a compatible duration or APNG for exact timing.
 - Added export tests for GIF transparent backgrounds, primary colors, APNG RGBA fidelity, and unsupported GIF timing.
 - Note: GIF supports at most 255 opaque colors plus transparency and cannot retain partial alpha; use APNG for lossless RGBA artwork.
+
+
+## Phase 1.0 tool activation and visual hierarchy (v16)
+- Active tool is prominently displayed in a color-accented banner with icon and usage hint.
+- Tool dropdown changes are explicitly connected to canvas activation, cursor, and dock behavior.
+- Pencil/Eraser recover the selected artwork layer if none is selected; tools never silently become Move.
+- Junior preview gives a specific instruction if no pixels have been highlighted.
+- Updated headings, typography, focus rings, hover feedback, and differentiated dock titles.
+- Source-level checks are not a substitute for real Windows GUI testing.
+
+## v17: Explicit moving exports
+- Junior Animator now has one-click **Export MOVING Sprite (APNG)** and **Export MOVING GIF** buttons.
+- Export format descriptions explicitly distinguish moving APNG/GIF, non-playing sprite sheets, and still PNG.
+- Still PNG export asks for confirmation and clearly warns it will not move.
+- APNG export defaults to `animation.png` (APNG is a PNG-compatible animated format).
+- GIF quick export reopens the file to verify it contains multiple frames.
+- Real Windows UI and file playback verification remain outstanding.
+\n## v18 Export dialog\nUse Export… Choose your formats (or Ctrl+E) to select APNG, GIF, still PNG, or all three in one export. All selected by default; outputs use unique suffixes.\n\n## Optional NFT Manager (v19)\nNFT Worksheet and Trait Generator now live together in a separate dockable, detachable, closable NFT Manager window. Hidden at launch; open from the main editor button. Hiding it retains loaded worksheet data and edits. Project controls remain visible for non-NFT artists.\n
+
+## v20 — Visual tool cursors
+Each drawing and animation tool now has its own small, high-contrast cursor glyph, colored to match its active-tool indicator. Move/Transform uses an open hand. The hotspot stays at the precise drawing point; cursors are generated at runtime, so no extra files are needed. Requires Windows GUI confirmation.
+\n## v22 — Three studios, Phase 1 foundation completed in code\nJunior Animator, Intermediate Studio (all advanced timeline tools), Desktop Pet & Creature Studio. Optional NFT Manager is not a fourth studio. Added visual click/drag pixel-snapped pose anchors, multiple independent frame-paint tracks with save/undo/recovery, frame reset, layer transform reset, and anchor eraser. Windows GUI validation and advanced transform keyframes remain outstanding.\n
+## v23 — Phase 2 started
+Intermediate Studio now has movement keyframes (pixel-snapped interpolated whole-sprite offsets) and reusable named paint clips (save a range/paste at current frame). Both persist in project files, undo/redo, and recovery. These are foundation features, not full Phase 2 completion.
+
+## v24 Phase 2 feature completion
+Intermediate Studio now includes independent per-layer pixel movement keyframes, a visual timeline marker strip, whole-sprite movement, reusable frame clips, and anchor interpolation preview for pose changes. The renderer composes moving layers before effects/paint, preserving the original layer positions. Anchor transitions preview alignment positions, not full pose morphing. Windows GUI and exported animation validation remain required before release.

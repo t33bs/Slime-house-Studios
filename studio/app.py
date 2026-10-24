@@ -2,17 +2,53 @@
 import base64, io, json, sys, csv
 from pathlib import Path
 from PIL import Image
-from PySide6.QtCore import Qt, QRect, QTimer
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QIcon, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QHBoxLayout,QVBoxLayout,QPushButton,QLabel,QListWidget,QFileDialog,QMessageBox,QComboBox,QSpinBox,QDoubleSpinBox,QFormLayout,QInputDialog,QTabWidget,QColorDialog,QLineEdit,QCheckBox,QScrollArea,QSlider,QTableWidget,QTableWidgetItem,QHeaderView,QDockWidget,QSizePolicy,QGroupBox)
+from PySide6.QtCore import Qt, QRect, QTimer, QSettings
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QIcon, QKeySequence, QShortcut, QFont, QCursor, QPixmap
+from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QHBoxLayout,QVBoxLayout,QPushButton,QLabel,QListWidget,QFileDialog,QMessageBox,QComboBox,QSpinBox,QDoubleSpinBox,QFormLayout,QInputDialog,QTabWidget,QColorDialog,QLineEdit,QCheckBox,QScrollArea,QSlider,QTableWidget,QTableWidgetItem,QHeaderView,QDockWidget,QSizePolicy,QGroupBox,QDialog,QDialogButtonBox)
 from .history import UndoHistory, capture, decode, atomic_write
 from .worksheet import NFTWorksheet
-from .core import Layer,Region,EFFECTS,composite,transformed,paint_pixel,frames_for,compose_timeline_frames,export_apng,export_gif,export_sprite_sheet,generate_traits
+from .core import Layer,Region,EFFECTS,composite,transformed,paint_pixel,frames_for,compose_timeline_frames,apply_motion_keyframes,paste_clip,compose_layer_motion_frames,interpolate_pose_anchors,export_apng,export_gif,export_sprite_sheet,generate_traits
 
 def resource_path(p):return Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent.parent))/p
 
 def qimage(im):
     im=im.convert('RGBA');return QImage(im.tobytes(),im.width,im.height,QImage.Format.Format_RGBA8888).copy()
+
+# Tiny high-contrast tool cursors, drawn locally so the EXE needs no extra assets.
+# The small crosshair is the exact canvas interaction point (hotspot 3,3).
+CURSOR_SYMBOLS={
+    'Pencil':'✎','Eraser':'⌫','Mask Brush':'✦','Mask Eraser':'◇',
+    'Frame Pencil':'✎','Frame Eraser':'⌫','Animation Region':'▭','Pose Anchor':'⌖',
+}
+CURSOR_COLORS={
+    'Pencil':'#ffe3a1','Eraser':'#ffb6b6','Mask Brush':'#91e6bb',
+    'Mask Eraser':'#a7d3ff','Frame Pencil':'#f5cf9c',
+    'Frame Eraser':'#ffb9bd','Animation Region':'#d5bbef','Pose Anchor':'#ffdc8b',
+}
+
+def cursor_for_tool(tool):
+    if tool=='Move / Transform':
+        return QCursor(Qt.CursorShape.OpenHandCursor)
+    if tool not in CURSOR_SYMBOLS:
+        return QCursor(Qt.CursorShape.CrossCursor)
+    pix=QPixmap(36,36)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter=QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing,False)
+    color=QColor(CURSOR_COLORS[tool])
+    # White/black crosshair remains readable on light or dark sprites.
+    painter.setPen(QPen(QColor('#10151b'),3))
+    painter.drawLine(3,0,3,7);painter.drawLine(0,3,7,3)
+    painter.setPen(QPen(color,1))
+    painter.drawLine(3,0,3,7);painter.drawLine(0,3,7,3)
+    painter.setBrush(QColor('#19232c'))
+    painter.setPen(QPen(color,2))
+    painter.drawRoundedRect(10,9,24,24,5,5)
+    painter.setFont(QFont('Segoe UI Symbol',15,QFont.Weight.Bold))
+    painter.setPen(QPen(color,1))
+    painter.drawText(QRect(11,10,22,22),Qt.AlignmentFlag.AlignCenter,CURSOR_SYMBOLS[tool])
+    painter.end()
+    return QCursor(pix,3,3)
 
 class Canvas(QWidget):
     def __init__(self,main):
@@ -48,9 +84,20 @@ class Canvas(QWidget):
                 for px,py in reg.mask:p.fillRect(self.rect_screen((px,py,1,1)),QColor(125,232,181,135))
             if self.drag and self.drag[0]=='region':
                 a=self.drag[1];b=self.drag[2];p.setPen(QPen(QColor('#f3d3fc'),2));p.drawRect(self.rect_screen((min(a[0],b[0]),min(a[1],b[1]),abs(a[0]-b[0])+1,abs(a[1]-b[1])+1)))
+        if m.tool.currentText()=='Pose Anchor' or (hasattr(m,'show_pet_anchors') and m.show_pet_anchors.isChecked()):
+            p.setRenderHint(QPainter.RenderHint.Antialiasing,False)
+            for name,xy in m.pet_anchors.get(m.pet_pose.currentText(),{}).items():
+                cx=int(self.ox+(xy[0]+.5)*self.zoom);cy=int(self.oy+(xy[1]+.5)*self.zoom)
+                p.setPen(QPen(QColor('#15202b'),4));p.drawEllipse(cx-6,cy-6,12,12)
+                p.setPen(QPen(QColor('#ffdc8b'),2));p.drawEllipse(cx-6,cy-6,12,12)
+                p.drawLine(cx-9,cy,cx+9,cy);p.drawLine(cx,cy-9,cx,cy+9)
+                p.setPen(QColor('#fff2c7'));p.drawText(cx+11,cy-9,name)
+
     def mousePressEvent(self,e):
         if e.button()!=Qt.MouseButton.LeftButton:return
         m=self.main;x,y=self.coord(e.position());l=m.selected_layer();tool=m.tool.currentText()
+        if tool=='Pose Anchor':
+            m.checkpoint();self.drag=['anchor'];self.place_anchor(x,y);return
         if tool in ('Frame Pencil','Frame Eraser'):
             m.checkpoint();self.drag=['framepaint'];self.frame_paint_at(x,y);return
         if tool=='Animation Region':m.checkpoint();self.drag=['region',(x,y),(x,y)];return
@@ -59,16 +106,25 @@ class Canvas(QWidget):
         if l is None:return
         if tool in ('Pencil','Eraser'):
             m.checkpoint();self.drag=['paint'];self.paint_at(x,y);return
+        if tool!='Move / Transform':return
         img=transformed(l);r=self.rect_screen((l.x,l.y,img.width,img.height));mx=e.position().x();my=e.position().y()
         if abs(mx-r.center().x())<14 and abs(my-(r.top()-17))<14:mode='rotate'
         elif abs(mx-r.right())<14 and abs(my-r.bottom())<14:mode='scale'
         else:mode='move'
         m.checkpoint();self.drag=[mode,x,y,l.x,l.y,l.scale,l.angle]
+    def place_anchor(self,x,y):
+        m=self.main
+        if not (0<=x<m.size_px[0] and 0<=y<m.size_px[1]):return
+        m.pet_anchor_x.setValue(x);m.pet_anchor_y.setValue(y)
+        pose=m.pet_pose.currentText();name=m.pet_anchor_name.currentText().strip() or 'Accessory'
+        m.pet_anchors.setdefault(pose,{})[name]=[x,y]
+        m.refresh_pet_anchors();self.update()
+
     def frame_paint_at(self,x,y):
         m=self.main
         if not 0<=x<m.size_px[0] or not 0<=y<m.size_px[1]:return
         index=m.frame_slider.value()
-        strokes=m.frame_edits.setdefault(str(index),[])
+        strokes=m.frame_tracks.setdefault(m.track_selector.currentText(),{}).setdefault(str(index),[])
         radius=m.brush.value()
         color=(0,0,0,0) if m.tool.currentText()=='Frame Eraser' else m.paint_color
         # Last edit wins, and strokes remain editable in the saved project.
@@ -77,13 +133,18 @@ class Canvas(QWidget):
             for xx in range(x-radius+1,x+radius):
                 if 0<=xx<m.size_px[0] and 0<=yy<m.size_px[1]:
                     positions[(xx,yy)]=[xx,yy,*color]
-        m.frame_edits[str(index)]=list(positions.values())
+        m.frame_tracks[m.track_selector.currentText()][str(index)]=list(positions.values())
+        m.sync_frame_edits()
         m.timeline_mode=True;m.stop_preview();m.canvas.update()
 
     def mask_at(self,x,y):
         m=self.main;idx=m.region_list.currentRow()
         if not 0<=idx<len(m.regions):
-            m.statusBar().showMessage('Select or create an animation region first',3000);return
+            if m.tool.currentText()=='Mask Brush':
+                m.add_region((0,0,*m.size_px))
+                idx=m.region_list.currentRow()
+            else:
+                m.statusBar().showMessage('Highlight pixels first, then erase parts of that highlight.',3000);return
         reg=m.regions[idx];pixels={tuple(p) for p in reg.mask}
         radius=max(1,m.mask_brush.value())
         for yy in range(y-radius+1,y+radius):
@@ -103,6 +164,7 @@ class Canvas(QWidget):
         if not self.drag:return
         m=self.main;x,y=self.coord(e.position());mode=self.drag[0]
         if mode=='region':self.drag[2]=(x,y);self.update();return
+        if mode=='anchor':self.place_anchor(x,y);return
         if mode=='paint':self.paint_at(x,y);return
         if mode=='framepaint':self.frame_paint_at(x,y);return
         if mode=='mask':self.mask_at(x,y);return
@@ -122,7 +184,7 @@ class Canvas(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__();self.setWindowTitle('Slime House Studios — Pixel Art & Animation');self.setWindowIcon(QIcon(str(resource_path('assets/slime_mascot.png'))));self.resize(1450,860)
-        self.worksheet=NFTWorksheet();self.worksheet_row=None;self.size_px=(64,64);self.layers=[];self.regions=[];self.traits={};self.preview=[];self.index=0;self.frame_edits={};self.timeline_mode=False;self.paint_color=(169,229,188,255)
+        self.settings=QSettings('Slime House Studios','Studio');self.pet_anchors={};self.frame_tracks={'Ink':{}};self.motion_keys={};self.layer_motion_keys={};self.pose_transition=None;self.frame_clips={};self.worksheet=NFTWorksheet();self.worksheet_row=None;self.size_px=(64,64);self.layers=[];self.regions=[];self.traits={};self.preview=[];self.index=0;self.frame_edits={};self.timeline_mode=False;self.paint_color=(169,229,188,255)
         self.history=UndoHistory();self._restoring=False;self._dirty=False;self.project_path=None
         self.recovery_path=Path.home()/'.slime_house_studios'/'recovery.json'
         self.autosave_timer=QTimer(self);self.autosave_timer.setInterval(60000);self.autosave_timer.timeout.connect(self.write_recovery);self.autosave_timer.start()
@@ -130,18 +192,32 @@ class MainWindow(QMainWindow):
         root=QWidget();self.setCentralWidget(root);layout=QHBoxLayout(root)
         self.setDockOptions(QMainWindow.DockOption.AllowTabbedDocks | QMainWindow.DockOption.AnimatedDocks)
         left=QWidget();lv=QVBoxLayout(left);left.setMaximumWidth(285);layout.addWidget(left)
-        lv.addWidget(QLabel('💚  SLIME HOUSE STUDIOS'))
-        lv.addWidget(QLabel('Pixel Art • Animation • NFT Creation'))
+        studio_title=QLabel('💚  SLIME HOUSE STUDIOS');studio_title.setObjectName('studioTitle');lv.addWidget(studio_title)
+        studio_subtitle=QLabel('Draw little things. Make them move.');studio_subtitle.setObjectName('studioSubtitle');lv.addWidget(studio_subtitle)
         self.sizes=QComboBox();self.sizes.addItems(['32 × 32','64 × 64','128 × 128','256 × 256','512 × 512','Custom…']);self.sizes.setCurrentIndex(1);self.sizes.currentIndexChanged.connect(self.change_size);lv.addWidget(self.sizes)
         b=QPushButton('Import PNG layer');b.clicked.connect(self.import_png);lv.addWidget(b)
         b=QPushButton('New blank paint layer');b.clicked.connect(self.new_layer);lv.addWidget(b)
-        self.layer_list=QListWidget();self.layer_list.currentRowChanged.connect(self.update_layer_controls);lv.addWidget(self.layer_list)
+        self.layer_list=QListWidget();self.layer_list.currentRowChanged.connect(self.update_layer_controls);self.layer_list.currentRowChanged.connect(self.refresh_layer_motion);lv.addWidget(self.layer_list)
         bar=QHBoxLayout();lv.addLayout(bar)
         for text,fn in [('↑',lambda:self.move_layer(1)),('↓',lambda:self.move_layer(-1)),('Delete',self.remove_layer)]:
             b=QPushButton(text);b.clicked.connect(fn);bar.addWidget(b)
-        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Pencil','Eraser','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser']);lv.addWidget(self.tool)
+        lv.addWidget(QLabel('YOUR ACTIVE TOOL'))
+        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Pencil','Eraser','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser','Pose Anchor']);lv.addWidget(self.tool)
+        self.active_tool_banner=QLabel('↔  Move / Transform  ·  Drag artwork to move it')
+        self.active_tool_banner.setObjectName('activeToolBanner')
+        self.active_tool_banner.setWordWrap(True)
+        lv.addWidget(self.active_tool_banner)
         self.animator_button=QPushButton('✨ Open Junior Animator');self.animator_button.setToolTip('Quick effects for funny moving sprites and NFTs');lv.addWidget(self.animator_button)
-        self.advanced_animator_button=QPushButton('🎞 Open Advanced Animator');self.advanced_animator_button.setToolTip('Frame-by-frame timeline for longer animations and GIFs');lv.addWidget(self.advanced_animator_button)
+        self.advanced_animator_button=QPushButton('🎞 Open Intermediate Studio');self.advanced_animator_button.setToolTip('Frame-by-frame timeline for longer animations and GIFs');lv.addWidget(self.advanced_animator_button)
+        self.pet_workshop_button=QPushButton('🐾 Open Desktop Pet Builder')
+        lv.addWidget(self.pet_workshop_button)
+        self.guided_toggle=QCheckBox('💡 Guided Mode — show beginner tips')
+        self.guided_toggle.setChecked(self.settings.value('guided_mode',True,type=bool))
+        self.guided_toggle.toggled.connect(self.update_guided_mode)
+        lv.addWidget(self.guided_toggle)
+        self.nft_manager_button=QPushButton('🐱 Open NFT Manager')
+        self.nft_manager_button.setToolTip('Optional NFT worksheet and trait tools — hide this for a clean pixel-art workspace.')
+        lv.addWidget(self.nft_manager_button)
         color=QPushButton('Choose brush color');color.clicked.connect(self.choose_color);lv.addWidget(color)
         self.brush=QSpinBox();self.brush.setRange(1,32);self.brush.setValue(1)
         self.x=QSpinBox();self.y=QSpinBox();self.scale=QDoubleSpinBox();self.angle=QDoubleSpinBox()
@@ -162,8 +238,8 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,self.animator_dock)
         self.animator_button.clicked.connect(self.toggle_animator)
         self.animator_dock.visibilityChanged.connect(self.animator_visibility_changed)
-        self.tool.currentTextChanged.connect(self.open_animator_for_tool)
-        self.advanced_animator_dock=QDockWidget('Advanced Animator — Timeline Studio',self)
+        self.tool.currentTextChanged.connect(self.activate_tool)
+        self.advanced_animator_dock=QDockWidget('Intermediate Studio — Timeline Studio',self)
         self.advanced_animator_dock.setObjectName('AdvancedAnimatorDock')
         self.advanced_animator_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.BottomDockWidgetArea)
         self.advanced_animator_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable | QDockWidget.DockWidgetFeature.DockWidgetMovable | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
@@ -172,7 +248,26 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,self.advanced_animator_dock)
         self.advanced_animator_button.clicked.connect(self.toggle_advanced_animator)
         self.advanced_animator_dock.visibilityChanged.connect(self.advanced_animator_visibility_changed)
-        av.addWidget(QLabel('Quick start: Highlight pixels → Pick a fun effect → Preview → Export.'))
+        av.addWidget(QLabel('Quick start: 1. Highlight pixels  2. Pick an effect  3. Preview  4. Export'))
+        junior_actions=QHBoxLayout()
+        self.highlight_button=QPushButton('🖍 Highlight to animate')
+        self.highlight_button.setToolTip('Draw directly over the pixels you want to move. A region is created automatically.')
+        self.highlight_button.clicked.connect(self.begin_highlighting)
+        junior_actions.addWidget(self.highlight_button)
+        self.highlight_erase_button=QPushButton('Erase highlight')
+        self.highlight_erase_button.clicked.connect(lambda:self.tool.setCurrentText('Mask Eraser'))
+        junior_actions.addWidget(self.highlight_erase_button)
+        av.addLayout(junior_actions)
+        self.junior_preview_button=QPushButton('▶ Preview my animation')
+        self.junior_preview_button.setToolTip('Play the selected animation on the main canvas.')
+        self.junior_preview_button.clicked.connect(self.start_preview)
+        av.addWidget(self.junior_preview_button)
+        self.junior_stop_button=QPushButton('■ Stop preview')
+        self.junior_stop_button.clicked.connect(self.stop_preview)
+        av.addWidget(self.junior_stop_button)
+        self.preview_hint=QLabel('Highlight a part of your sprite, then click Preview.')
+        self.preview_hint.setWordWrap(True)
+        av.addWidget(self.preview_hint)
         self.advanced_layout.addWidget(QLabel('Frame-by-frame editing for longer GIFs and animated sprites.'))
         self.advanced_layout.addWidget(QLabel('Both animators share the same artwork, regions, and animation frames.'))
         self.mask_brush=QSpinBox();self.mask_brush.setRange(1,32);self.mask_brush.setValue(1);av.addWidget(QLabel('Mask brush size'));av.addWidget(self.mask_brush)
@@ -225,16 +320,36 @@ class MainWindow(QMainWindow):
         self.fps_label=QLabel('10.0 FPS')
         self.total_duration_label=QLabel('1.20 seconds')
         self.loop_count=QSpinBox();self.loop_count.setRange(0,1000);self.loop_count.setSpecialValueText('Forever');self.loop_count.setValue(0)
-        self.export_format=QComboBox();self.export_format.addItems(['Animated PNG (.apng)','Animated GIF (.gif)','Sprite sheet (.png)','Still PNG (.png)'])
+        self.export_format=QComboBox();self.export_format.addItems(['✨ Animated PNG / APNG (.png)','🎞 Animated GIF (.gif)','▦ Sprite sheet (.png) — frames side by side','🖼 Still image (.png) — NO ANIMATION'])
         for label,control in [('Speed preset',self.speed_preset),('Frame count',self.frames),('Milliseconds / frame',self.duration),('Effective speed',self.fps_label),('Total duration',self.total_duration_label),('Animation loops',self.loop_count),('Export format',self.export_format)]:settings.addRow(label,control)
         self.frames.valueChanged.connect(self.update_duration_summary)
         self.duration.valueChanged.connect(self.update_duration_summary)
         self.update_duration_summary()
         self.advanced_layout.addWidget(self.export_settings)
+        self.export_tip=QLabel('✨ APNG keeps full-color transparency and MOVES. GIF is best for sharing. Still PNG does not animate.')
+        self.export_tip.setWordWrap(True)
+        av.addWidget(self.export_tip)
+        self.export_format.currentIndexChanged.connect(self.update_export_tip)
+        self.update_export_tip()
+        self.quick_apng=QPushButton('✨ Export… Choose your formats')
+        self.quick_apng.setToolTip('Export an animated PNG with all frames, regardless of the advanced export dropdown.')
+        self.quick_apng.clicked.connect(self.export_choose_formats)
+        av.addWidget(self.quick_apng)
+        self.quick_gif=QPushButton('🎞 Quick Export GIF')
+        self.quick_gif.clicked.connect(self.save_gif)
+        av.addWidget(self.quick_gif)
 
-        for text,fn in [('Add full-canvas region',lambda:self.add_region((0,0,*self.size_px))),('Delete selected region',self.delete_region),('Clear selected pixel mask',self.clear_mask),('Preview animation',self.start_preview),('Stop preview',self.stop_preview),('Export animation / image',self.export_selected_format)]:
+        for text,fn in [('Add full-canvas region',lambda:self.add_region((0,0,*self.size_px))),('Delete selected region',self.delete_region),('Clear selected pixel mask',self.clear_mask),('Preview animation',self.start_preview),('Stop preview',self.stop_preview),('Export… Choose formats',self.export_choose_formats)]:
             b=QPushButton(text);b.clicked.connect(fn);av.addWidget(b)
         self.advanced_layout.addWidget(QLabel('Frame-by-frame timeline'))
+        self.advanced_layout.addWidget(QLabel('EDITING TRACK — independent paint layers per frame'))
+        self.track_selector=QComboBox();self.track_selector.addItems(['Ink'])
+        self.track_selector.currentTextChanged.connect(self.switch_frame_track)
+        self.advanced_layout.addWidget(self.track_selector)
+        track_actions=QHBoxLayout()
+        for title,callback in [('＋ Add track',self.add_frame_track),('− Remove track',self.remove_frame_track)]:
+            button=QPushButton(title);button.clicked.connect(callback);track_actions.addWidget(button)
+        self.advanced_layout.addLayout(track_actions)
         self.frame_slider=QSlider(Qt.Orientation.Horizontal)
         self.frame_slider.setRange(0,self.frames.value()-1)
         self.frame_slider.valueChanged.connect(self.show_timeline_frame)
@@ -244,12 +359,121 @@ class MainWindow(QMainWindow):
         self.onion_enabled=QCheckBox('Onion skin (previous frame)')
         self.onion_enabled.toggled.connect(self.canvas.update)
         self.advanced_layout.addWidget(self.onion_enabled)
-        for text,fn in [('Edit selected frame',self.enable_timeline),('Duplicate previous frame edits',self.duplicate_frame),('Clear frame edits',self.clear_frame),('Previous frame',lambda:self.step_frame(-1)),('Next frame',lambda:self.step_frame(1))]:
+        for text,fn in [('Edit selected frame',self.enable_timeline),('Duplicate previous frame edits',self.duplicate_frame),('Clear frame edits',self.clear_frame),('Reset current frame',self.reset_current_frame),('Previous frame',lambda:self.step_frame(-1)),('Next frame',lambda:self.step_frame(1))]:
             b=QPushButton(text);b.clicked.connect(fn);self.advanced_layout.addWidget(b)
+        motion_group=QGroupBox('↗ Movement keyframes — whole sprite')
+        motion_layout=QVBoxLayout(motion_group)
+        motion_layout.addWidget(QLabel('Set pixel offsets at two or more frames; movement fills in between.'))
+        self.motion_x=QSpinBox();self.motion_y=QSpinBox()
+        for control in (self.motion_x,self.motion_y):control.setRange(-512,512)
+        movement=QFormLayout();movement.addRow('Horizontal (px)',self.motion_x);movement.addRow('Vertical (px)',self.motion_y)
+        motion_layout.addLayout(movement)
+        for title,fn in [('◆ Set movement keyframe',self.set_motion_keyframe),('⌫ Remove keyframe',self.remove_motion_keyframe),('↺ Clear all movement',self.clear_motion_keyframes)]:
+            button=QPushButton(title);button.clicked.connect(fn);motion_layout.addWidget(button)
+        self.motion_summary=QLabel('No movement keyframes yet')
+        self.motion_summary.setWordWrap(True);motion_layout.addWidget(self.motion_summary)
+        self.advanced_layout.addWidget(motion_group)
+        layer_group=QGroupBox('◇ Selected layer movement — independent keyframes')
+        layer_layout=QVBoxLayout(layer_group)
+        layer_tip=QLabel('Choose an artwork layer in the left panel. Set movement at the current frame; other layers stay put.')
+        layer_tip.setWordWrap(True);layer_layout.addWidget(layer_tip)
+        self.layer_motion_x=QSpinBox();self.layer_motion_y=QSpinBox()
+        for control in (self.layer_motion_x,self.layer_motion_y):control.setRange(-512,512)
+        layer_form=QFormLayout();layer_form.addRow('Layer offset X',self.layer_motion_x);layer_form.addRow('Layer offset Y',self.layer_motion_y)
+        layer_layout.addLayout(layer_form)
+        for title,fn in [('◆ Set layer keyframe',self.set_layer_motion_keyframe),('⌫ Remove layer keyframe',self.remove_layer_motion_keyframe)]:
+            b=QPushButton(title);b.clicked.connect(fn);layer_layout.addWidget(b)
+        self.layer_motion_summary=QLabel('Select a layer to edit its movement')
+        self.layer_motion_summary.setWordWrap(True);layer_layout.addWidget(self.layer_motion_summary)
+        self.advanced_layout.addWidget(layer_group)
+        self.timeline_markers=QLabel('◆ Keyframes appear here for the selected frame range')
+        self.timeline_markers.setWordWrap(True);self.advanced_layout.addWidget(self.timeline_markers)
+
+        clip_group=QGroupBox('▣ Reusable frame clips')
+        clip_layout=QVBoxLayout(clip_group)
+        clip_layout.addWidget(QLabel('Save a range of frames from the selected paint track. Paste into another frame or project.'))
+        self.clip_start=QSpinBox();self.clip_end=QSpinBox()
+        for spin in (self.clip_start,self.clip_end):spin.setRange(1,1000)
+        self.clip_start.setValue(1);self.clip_end.setValue(3)
+        range_form=QFormLayout();range_form.addRow('First frame',self.clip_start);range_form.addRow('Last frame',self.clip_end)
+        clip_layout.addLayout(range_form)
+        self.clip_selector=QComboBox();clip_layout.addWidget(self.clip_selector)
+        for title,fn in [('＋ Save selected range as clip',self.save_frame_clip),('⇥ Paste clip at current frame',self.paste_frame_clip),('− Delete saved clip',self.delete_frame_clip)]:
+            button=QPushButton(title);button.clicked.connect(fn);clip_layout.addWidget(button)
+        self.advanced_layout.addWidget(clip_group)
         self.advanced_layout.addWidget(QLabel('Choose Frame Pencil or Frame Eraser to paint on the selected frame.'))
         self.advanced_layout.addStretch()
         av.addStretch()
-        worksheet=QWidget();wv=QVBoxLayout(worksheet);self.tabs.addTab(worksheet,'NFT Worksheet')
+        # Desktop Pet Builder: optional dock, using the existing sprite and animation engine.
+        self.pet_workshop_dock=QDockWidget('Desktop Pet & Creature Studio',self)
+        self.pet_workshop_dock.setObjectName('DesktopPetBuilderDock')
+        self.pet_workshop_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable | QDockWidget.DockWidgetFeature.DockWidgetMovable | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+        self.pet_workshop_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        pet_scroll=QScrollArea();pet_scroll.setWidgetResizable(True)
+        pet_widget=QWidget();pet_layout=QVBoxLayout(pet_widget)
+        pet_scroll.setWidget(pet_widget);self.pet_workshop_dock.setWidget(pet_scroll)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,self.pet_workshop_dock)
+        self.pet_workshop_button.clicked.connect(self.toggle_pet_workshop)
+        self.pet_workshop_dock.visibilityChanged.connect(self.pet_workshop_visibility_changed)
+        pet_layout.addWidget(QLabel('🐾 Set attachment anchors for reusable desktop-pet poses.'))
+        self.pet_help=QLabel('Choose a pose, enter an anchor name and X/Y pixel coordinates, then save it in your project. Use anchors to align accessories between different poses.')
+        self.pet_help.setWordWrap(True);pet_layout.addWidget(self.pet_help)
+        self.pet_pose=QComboBox();self.pet_pose.addItems(['Idle','Walk','Run','Jump','Sleep','Crawl','Sit','Attack','Custom'])
+        pet_layout.addWidget(QLabel('Pet pose'));pet_layout.addWidget(self.pet_pose)
+        pose_transition_box=QGroupBox('↝ Pose transition preview')
+        pose_transition_layout=QFormLayout(pose_transition_box)
+        self.pose_start=QComboBox();self.pose_end=QComboBox()
+        for selector in (self.pose_start,self.pose_end):selector.addItems(['Idle','Walk','Run','Jump','Sleep','Crawl','Sit','Attack','Custom'])
+        self.pose_end.setCurrentText('Walk')
+        pose_transition_layout.addRow('From pose',self.pose_start);pose_transition_layout.addRow('To pose',self.pose_end)
+        self.pose_transition_preview=QLabel('Choose two poses to preview how shared anchors move.')
+        self.pose_transition_preview.setWordWrap(True)
+        button=QPushButton('↝ Preview anchor transition')
+        button.clicked.connect(self.preview_pose_transition)
+        pose_transition_layout.addRow(button);pose_transition_layout.addRow(self.pose_transition_preview)
+        pet_layout.addWidget(pose_transition_box)
+        self.pet_anchor_name=QComboBox();self.pet_anchor_name.setEditable(True)
+        self.pet_anchor_name.addItems(['Head','Left Ear','Right Ear','Neck','Left Hand','Right Hand','Back','Feet','Tail','Accessory'])
+        pet_layout.addWidget(QLabel('Attachment anchor'));pet_layout.addWidget(self.pet_anchor_name)
+        self.pet_anchor_x=QSpinBox();self.pet_anchor_y=QSpinBox()
+        for spin in (self.pet_anchor_x,self.pet_anchor_y):spin.setRange(0,2048)
+        self.pet_anchor_x.setValue(32);self.pet_anchor_y.setValue(32)
+        pet_coords=QFormLayout();pet_coords.addRow('Anchor X (px)',self.pet_anchor_x);pet_coords.addRow('Anchor Y (px)',self.pet_anchor_y)
+        pet_layout.addLayout(pet_coords)
+        save_anchor=QPushButton('📌 Save pose anchor');save_anchor.clicked.connect(self.save_pet_anchor);pet_layout.addWidget(save_anchor)
+        remove_anchor=QPushButton('Remove selected anchor');remove_anchor.clicked.connect(self.remove_pet_anchor);pet_layout.addWidget(remove_anchor)
+        self.pet_anchor_list=QListWidget();pet_layout.addWidget(self.pet_anchor_list)
+        self.pet_anchor_list.itemClicked.connect(self.select_pet_anchor)
+        self.pet_pose.currentTextChanged.connect(self.refresh_pet_anchors)
+        self.show_pet_anchors=QCheckBox('Show pose anchors on canvas')
+        self.show_pet_anchors.setChecked(True);self.show_pet_anchors.toggled.connect(self.canvas.update)
+        pet_layout.addWidget(self.show_pet_anchors)
+        place_anchor_button=QPushButton('⌖ Place anchor on canvas')
+        place_anchor_button.clicked.connect(lambda:self.tool.setCurrentText('Pose Anchor'))
+        pet_layout.addWidget(place_anchor_button)
+        pet_layout.addWidget(QLabel('Anchors snap to whole sprite pixels and can be dragged with the Pose Anchor tool.'))
+        clear_anchor=QPushButton('⌫ Erase selected pose anchor')
+        clear_anchor.clicked.connect(self.remove_pet_anchor);pet_layout.addWidget(clear_anchor)
+        reset_mesh=QPushButton('↺ Reset selected layer transform (mesh)')
+        reset_mesh.setToolTip('Reset the selected layer to 100% scale and 0° rotation without deleting artwork.')
+        reset_mesh.clicked.connect(self.reset_layer_mesh);pet_layout.addWidget(reset_mesh)
+        pet_layout.addWidget(QLabel('Anchors are stored in editable project JSON and can be undone/redone.'))
+        pet_layout.addStretch()
+        # NFT tools live in an optional, independent dock rather than occupying
+        # the main editor's permanent sidebar. Closing the dock preserves state.
+        self.nft_manager_dock=QDockWidget('NFT Manager — Optional Tools',self)
+        self.nft_manager_dock.setObjectName('NFTManagerDock')
+        self.nft_manager_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.BottomDockWidgetArea)
+        self.nft_manager_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable | QDockWidget.DockWidgetFeature.DockWidgetMovable | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+        nft_scroll=QScrollArea()
+        nft_scroll.setWidgetResizable(True)
+        self.nft_manager_tabs=QTabWidget()
+        nft_scroll.setWidget(self.nft_manager_tabs)
+        self.nft_manager_dock.setWidget(nft_scroll)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,self.nft_manager_dock)
+        self.nft_manager_button.clicked.connect(self.toggle_nft_manager)
+        self.nft_manager_dock.visibilityChanged.connect(self.nft_manager_visibility_changed)
+        worksheet=QWidget();wv=QVBoxLayout(worksheet);self.nft_manager_tabs.addTab(worksheet,'NFT Worksheet')
         wv.addWidget(QLabel('Upload Excel or CSV, enter an NFT number, then edit its traits.'))
         upload=QPushButton('Open worksheet (.xlsx / .csv)');upload.clicked.connect(self.open_worksheet);wv.addWidget(upload)
         self.worksheet_info=QLabel('No worksheet loaded');self.worksheet_info.setWordWrap(True);wv.addWidget(self.worksheet_info)
@@ -264,7 +488,7 @@ class MainWindow(QMainWindow):
         export_btn=QPushButton('Export updated worksheet');export_btn.clicked.connect(self.export_worksheet);save_row.addWidget(export_btn)
         wv.addWidget(QLabel('Original worksheet is never overwritten automatically. Export saves a new file.'))
         wv.addStretch()
-        nft=QWidget();nv=QVBoxLayout(nft);self.tabs.addTab(nft,'Trait Generator')
+        nft=QWidget();nv=QVBoxLayout(nft);self.nft_manager_tabs.addTab(nft,'Trait Generator')
         nv.addWidget(QLabel('Weighted trait combinations (metadata CSV / JSON)'))
         self.trait_list=QListWidget();nv.addWidget(self.trait_list)
         for text,fn in [('Add trait',self.add_trait),('Remove selected trait',self.remove_trait),('Import trait JSON',self.import_traits),('Export trait JSON',self.export_traits)]:
@@ -277,10 +501,27 @@ class MainWindow(QMainWindow):
         pv.addWidget(QLabel('Project files include layers, transforms, regions and traits.'));pv.addStretch()
         self.animator_dock.hide()
         self.advanced_animator_dock.hide()
+        self.nft_manager_dock.hide()
+        self.pet_workshop_dock.hide()
         self.install_beginner_helpers()
+        self.update_guided_mode(self.guided_toggle.isChecked())
+        self.activate_tool(self.tool.currentText())
         QTimer.singleShot(0,self.offer_recovery)
-        self.statusBar().showMessage('Ready — import a PNG or create a layer. Choose Junior for quick effects or Advanced for timeline editing.')
-        self.setStyleSheet('''QWidget{background:#1b222e;color:#d8e3e5;font-size:13px} QPushButton,QComboBox,QSpinBox,QDoubleSpinBox,QListWidget,QTabWidget::pane{background:#2b3544;border:1px solid #445064;border-radius:6px;padding:6px} QPushButton:hover{background:#3c5260} QListWidget::item:selected{background:#496d65} QTabBar::tab{background:#25303d;padding:10px} QTabBar::tab:selected{background:#426758}''')
+        self.statusBar().showMessage('Ready — import a PNG or create a layer. Choose Junior for quick effects or Intermediate for timeline editing.')
+        self.setStyleSheet('''QWidget{background:#1b222e;color:#d8e3e5;font-family:"Segoe UI";font-size:13px}
+        QPushButton,QComboBox,QSpinBox,QDoubleSpinBox,QListWidget,QTabWidget::pane{background:#2b3544;border:1px solid #445064;border-radius:7px;padding:6px}
+        QPushButton:hover{background:#3c5260;border-color:#83d7b0}
+        QPushButton:pressed{background:#467c6b}
+        QComboBox:focus,QSpinBox:focus{border:2px solid #7bdbb2}
+        QListWidget::item:selected{background:#496d65}
+        QTabBar::tab{background:#25303d;padding:10px}
+        QTabBar::tab:selected{background:#426758;color:#e1ffed}
+        QLabel#activeToolBanner{background:#24473f;color:#b9f6d2;border:1px solid #63bfa0;border-radius:9px;padding:11px;font-size:14px;font-weight:700}
+        QLabel#studioTitle{font-family:"Trebuchet MS","Segoe UI";font-size:20px;font-weight:800;color:#a8f3c6}
+        QLabel#studioSubtitle{color:#a5b4c2;font-style:italic}
+        QGroupBox{font-weight:700;border:1px solid #40566a;border-radius:8px;margin-top:10px;padding-top:12px}
+        QGroupBox::title{color:#a8e7d0}
+        QDockWidget::title{background:#29433f;color:#d3ffdf;font-weight:700;padding:8px}''')
     def install_beginner_helpers(self):
         """Keep the workspace simple while making every advanced tool discoverable."""
         hints={
@@ -309,9 +550,72 @@ class MainWindow(QMainWindow):
         self.tool.setToolTip('Choose how the mouse interacts with the canvas.')
         self.layer_list.setToolTip('Select the artwork layer you want to edit.')
         self.setStatusTip('Tip: Import a PNG or create a blank layer to begin.')
-        for keys,fn in [('Ctrl+Z',self.undo),('Ctrl+Shift+Z',self.redo),('Ctrl+Y',self.redo),('Ctrl+O',self.load_project),('Ctrl+S',self.save_project),('Ctrl+I',self.import_png),('Ctrl+E',self.export_selected_format)]:
+        for keys,fn in [('Ctrl+Z',self.undo),('Ctrl+Shift+Z',self.redo),('Ctrl+Y',self.redo),('Ctrl+O',self.load_project),('Ctrl+S',self.save_project),('Ctrl+I',self.import_png),('Ctrl+E',self.export_choose_formats)]:
             shortcut=QShortcut(QKeySequence(keys),self);shortcut.activated.connect(fn)
         self.statusBar().showMessage('Ready! Import a PNG or create a blank layer. Hover over a tool for help.',9000)
+
+    def update_guided_mode(self,enabled):
+        self.settings.setValue('guided_mode',bool(enabled))
+        self.active_tool_banner.setVisible(enabled)
+        self.pet_help.setVisible(enabled)
+        self.statusBar().showMessage('Guided Mode on — tool tips are visible' if enabled else 'Guided Mode off — compact workspace',3500)
+
+    def toggle_pet_workshop(self):
+        if self.pet_workshop_dock.isVisible():self.pet_workshop_dock.hide()
+        else:self.pet_workshop_dock.show();self.pet_workshop_dock.raise_()
+
+    def pet_workshop_visibility_changed(self,visible):
+        self.pet_workshop_button.setText('🐾 Hide Desktop Pet Builder' if visible else '🐾 Open Desktop Pet Builder')
+
+    def reset_layer_mesh(self):
+        layer=self.selected_layer()
+        if layer is None:
+            QMessageBox.information(self,'Select a layer','Choose an artwork layer to reset.');return
+        self.checkpoint()
+        layer.scale=1.0;layer.angle=0
+        self.update_layer_controls();self.invalidate()
+        self.statusBar().showMessage('Layer transform reset — artwork pixels preserved.',4000)
+
+    def save_pet_anchor(self):
+        name=self.pet_anchor_name.currentText().strip()
+        if not name:
+            QMessageBox.warning(self,'Missing anchor name','Enter an anchor name.');return
+        self.checkpoint()
+        pose=self.pet_pose.currentText()
+        self.pet_anchors.setdefault(pose,{})[name]=[self.pet_anchor_x.value(),self.pet_anchor_y.value()]
+        self.refresh_pet_anchors()
+
+    def remove_pet_anchor(self):
+        item=self.pet_anchor_list.currentItem()
+        if item is None:return
+        pose=self.pet_pose.currentText();name=item.data(Qt.ItemDataRole.UserRole)
+        if name in self.pet_anchors.get(pose,{}):
+            self.checkpoint();del self.pet_anchors[pose][name];self.refresh_pet_anchors()
+
+    def refresh_pet_anchors(self,*args):
+        self.pet_anchor_list.clear()
+        for name,xy in sorted(self.pet_anchors.get(self.pet_pose.currentText(),{}).items()):
+            from PySide6.QtWidgets import QListWidgetItem
+            item=QListWidgetItem(f'{name}: ({xy[0]}, {xy[1]})')
+            item.setData(Qt.ItemDataRole.UserRole,name)
+            self.pet_anchor_list.addItem(item)
+
+    def select_pet_anchor(self,item):
+        name=item.data(Qt.ItemDataRole.UserRole)
+        xy=self.pet_anchors.get(self.pet_pose.currentText(),{}).get(name)
+        if xy:
+            self.pet_anchor_name.setCurrentText(name)
+            self.pet_anchor_x.setValue(xy[0]);self.pet_anchor_y.setValue(xy[1])
+
+    def toggle_nft_manager(self):
+        if self.nft_manager_dock.isVisible():
+            self.nft_manager_dock.hide()
+        else:
+            self.nft_manager_dock.show()
+            self.nft_manager_dock.raise_()
+
+    def nft_manager_visibility_changed(self,visible):
+        self.nft_manager_button.setText('🐱 Hide NFT Manager' if visible else '🐱 Open NFT Manager')
 
     def toggle_animator(self):
         self.animator_dock.setVisible(not self.animator_dock.isVisible())
@@ -322,28 +626,186 @@ class MainWindow(QMainWindow):
         self.advanced_animator_dock.setVisible(not self.advanced_animator_dock.isVisible())
         if self.advanced_animator_dock.isVisible():self.advanced_animator_dock.raise_()
     def advanced_animator_visibility_changed(self,visible):
-        self.advanced_animator_button.setText('🎞 Hide Advanced Animator' if visible else '🎞 Open Advanced Animator')
+        self.advanced_animator_button.setText('🎞 Hide Intermediate Studio' if visible else '🎞 Open Intermediate Studio')
+    def activate_tool(self,tool):
+        # Changing tools must visibly activate the canvas mode; it should not
+        # silently deselect the art and leave the user wondering what happened.
+        labels={
+            'Move / Transform':('↔','Drag artwork to move, resize or rotate','#b9e4c9'),
+            'Pencil':('✏','Draw on your selected layer','#ffe3a1'),
+            'Eraser':('⌫','Erase artwork on your selected layer','#ffb6b6'),
+            'Animation Region':('▭','Drag a rectangle (Advanced / legacy)','#d5bbef'),
+            'Mask Brush':('🖍','Paint highlights over pixels to animate','#91e6bb'),
+            'Mask Eraser':('◌','Brush away highlights; art stays safe','#a7d3ff'),
+            'Frame Pencil':('✎','Draw on the selected animation frame','#f5cf9c'),
+            'Frame Eraser':('⌫','Erase on the selected animation frame','#ffb9bd'),
+            'Pose Anchor':('⌖','Click to place or drag an attachment anchor','#ffdc8b'),
+        }
+        symbol,tip,color=labels.get(tool,('•','Click on the canvas','#b9e4c9'))
+        self.active_tool_banner.setText(f'{symbol}  {tool}\\n{tip}')
+        self.active_tool_banner.setStyleSheet(f'QLabel#activeToolBanner {{ border-color:{color}; }}')
+        if tool in ('Pencil','Eraser','Move / Transform') and self.layers and self.layer_list.currentRow()<0:
+            self.layer_list.setCurrentRow(len(self.layers)-1)
+        if tool in ('Pencil','Eraser') and not self.layers:
+            self.statusBar().showMessage('Create a blank paint layer or import a PNG to start drawing.',7000)
+        else:
+            self.statusBar().showMessage(f'Active tool: {tool} — {tip}',5000)
+        self.canvas.setCursor(cursor_for_tool(tool))
+        self.open_animator_for_tool(tool)
+        self.canvas.update()
+
     def open_animator_for_tool(self,tool):
         if tool in ('Animation Region','Mask Brush','Mask Eraser'):
             self.animator_dock.show();self.animator_dock.raise_()
         elif tool in ('Frame Pencil','Frame Eraser'):
             self.advanced_animator_dock.show();self.advanced_animator_dock.raise_()
     def invalidate(self):self.stop_preview();self.canvas.update()
-    def stop_preview(self):self.timer.stop();self.preview=[];self.canvas.update()
+    def stop_preview(self):
+        self.timer.stop();self.preview=[]
+        if hasattr(self,'preview_hint'):self.preview_hint.setText('Preview stopped. Highlight pixels or choose another effect.')
+        self.canvas.update()
     def current_image(self):
         if self.preview:return self.preview[self.index]
         if self.timeline_mode:return self.timeline_frames()[self.frame_slider.value()]
         return composite(self.layers,self.size_px)
+    def sync_frame_edits(self):
+        # Existing renderer consumes flattened edits; separate editable tracks
+        # remain in frame_tracks, in visible track order (last track wins).
+        merged={}
+        for track in self.frame_tracks.values():
+            for frame,strokes in track.items():
+                pixels=merged.setdefault(str(frame),{})
+                for stroke in strokes:pixels[(int(stroke[0]),int(stroke[1]))]=list(stroke)
+        self.frame_edits={frame:list(pixels.values()) for frame,pixels in merged.items()}
+
+    def switch_frame_track(self,*args):
+        self.canvas.update()
+
+    def add_frame_track(self):
+        name,ok=QInputDialog.getText(self,'Add animation track','Track name:')
+        name=name.strip()
+        if not ok or not name:return
+        if name in self.frame_tracks:
+            QMessageBox.information(self,'Track exists','Choose a different track name.');return
+        self.checkpoint();self.frame_tracks[name]={};self.track_selector.addItem(name)
+        self.track_selector.setCurrentText(name)
+
+    def remove_frame_track(self):
+        name=self.track_selector.currentText()
+        if len(self.frame_tracks)<=1:
+            QMessageBox.information(self,'Keep one track','At least one frame track is required.');return
+        if QMessageBox.question(self,'Remove track?',f'Remove track "{name}" and its frame edits?',QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
+        self.checkpoint();del self.frame_tracks[name];self.track_selector.removeItem(self.track_selector.currentIndex())
+        self.sync_frame_edits();self.invalidate()
+
+    def reset_current_frame(self):
+        frame=str(self.frame_slider.value())
+        if not any(frame in track for track in self.frame_tracks.values()):return
+        if QMessageBox.question(self,'Reset frame?', 'Remove edits on this frame from ALL tracks?',QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
+        self.checkpoint()
+        for track in self.frame_tracks.values():track.pop(frame,None)
+        self.sync_frame_edits();self.enable_timeline()
+
+    def set_motion_keyframe(self):
+        self.checkpoint();self.motion_keys[str(self.frame_slider.value())]=[self.motion_x.value(),self.motion_y.value()]
+        self.refresh_motion_summary();self.refresh_timeline_markers();self.enable_timeline()
+
+    def remove_motion_keyframe(self):
+        key=str(self.frame_slider.value())
+        if key not in self.motion_keys:return
+        self.checkpoint();del self.motion_keys[key];self.refresh_motion_summary();self.enable_timeline()
+
+    def clear_motion_keyframes(self):
+        if not self.motion_keys:return
+        self.checkpoint();self.motion_keys={};self.refresh_motion_summary();self.enable_timeline()
+
+    def refresh_motion_summary(self):
+        keys=sorted(self.motion_keys,key=lambda k:int(k))
+        self.motion_summary.setText('Keyframes: '+(', '.join(str(int(k)+1) for k in keys) if keys else 'none'))
+        self.refresh_timeline_markers()
+        key=self.motion_keys.get(str(self.frame_slider.value()),[0,0])
+        self.motion_x.blockSignals(True);self.motion_y.blockSignals(True)
+        self.motion_x.setValue(int(key[0]));self.motion_y.setValue(int(key[1]))
+        self.motion_x.blockSignals(False);self.motion_y.blockSignals(False)
+
+    def save_frame_clip(self):
+        start=self.clip_start.value()-1;end=self.clip_end.value()-1
+        if end<start or end>=self.frames.value():
+            QMessageBox.warning(self,'Invalid range','Choose frames within the timeline, with the first before the last.');return
+        name,ok=QInputDialog.getText(self,'Save reusable clip','Clip name:')
+        if not ok or not name.strip():return
+        name=name.strip()
+        if name in self.frame_clips:
+            QMessageBox.warning(self,'Name in use','Choose a new clip name.');return
+        track=self.frame_tracks[self.track_selector.currentText()]
+        data={str(i-start):json.loads(json.dumps(track.get(str(i),[]))) for i in range(start,end+1)}
+        self.checkpoint();self.frame_clips[name]=data;self.clip_selector.addItem(name)
+        self.clip_selector.setCurrentText(name)
+        self.statusBar().showMessage(f'Clip saved: {name} ({end-start+1} frames)',4000)
+
+    def paste_frame_clip(self):
+        name=self.clip_selector.currentText()
+        if name not in self.frame_clips:return
+        self.checkpoint();track_name=self.track_selector.currentText()
+        self.frame_tracks[track_name]=paste_clip(self.frame_tracks[track_name],self.frame_clips[name],self.frame_slider.value(),self.frames.value())
+        self.sync_frame_edits();self.enable_timeline()
+
+    def delete_frame_clip(self):
+        name=self.clip_selector.currentText()
+        if name not in self.frame_clips:return
+        self.checkpoint();del self.frame_clips[name];self.clip_selector.removeItem(self.clip_selector.currentIndex())
+
+    def set_layer_motion_keyframe(self):
+        index=self.layer_list.currentRow()
+        if index<0 or index>=len(self.layers):
+            QMessageBox.information(self,'Choose a layer','Select an artwork layer first.');return
+        self.checkpoint()
+        self.layer_motion_keys.setdefault(str(index),{})[str(self.frame_slider.value())]=[self.layer_motion_x.value(),self.layer_motion_y.value()]
+        self.refresh_layer_motion();self.enable_timeline()
+
+    def remove_layer_motion_keyframe(self):
+        index=str(self.layer_list.currentRow());frame=str(self.frame_slider.value())
+        if frame not in self.layer_motion_keys.get(index,{}):return
+        self.checkpoint();self.layer_motion_keys[index].pop(frame)
+        self.refresh_layer_motion();self.enable_timeline()
+
+    def refresh_layer_motion(self,*args):
+        if not hasattr(self,'layer_motion_summary'):return
+        index=self.layer_list.currentRow();keys=self.layer_motion_keys.get(str(index),{})
+        self.layer_motion_summary.setText('Layer keyframes: '+(', '.join(str(int(k)+1) for k in sorted(keys,key=int)) if keys else 'none'))
+        value=keys.get(str(self.frame_slider.value()),[0,0])
+        for spin,n in ((self.layer_motion_x,0),(self.layer_motion_y,1)):
+            spin.blockSignals(True);spin.setValue(int(value[n]));spin.blockSignals(False)
+        self.refresh_timeline_markers()
+
+    def refresh_timeline_markers(self):
+        if not hasattr(self,'timeline_markers'):return
+        global_keys=set(map(int,self.motion_keys))
+        local_keys=set(map(int,self.layer_motion_keys.get(str(self.layer_list.currentRow()),{})))
+        total=self.frames.value()
+        # Compact keyframe strip, with ◆ for the selected layer, ● for whole sprite.
+        symbols=['◆' if i in local_keys else '●' if i in global_keys else '·' for i in range(total)]
+        self.timeline_markers.setText('Frame markers (◆ layer, ● whole sprite):\n'+' '.join(symbols))
+
+    def preview_pose_transition(self):
+        start=self.pose_start.currentText();end=self.pose_end.currentText()
+        sequence=interpolate_pose_anchors(self.pet_anchors,start,end,self.frames.value())
+        self.pose_transition={'start':start,'end':end,'anchors':sequence}
+        self.pose_transition_preview.setText(f'{start} → {end}: {len(sequence)} interpolated anchor frames.\n'
+            +' | '.join(f'{name}: {pos}' for name,pos in list(sequence[-1].items())[:4])
+            +'\nAnchor motion preview only; artwork pose morphing is not implied.')
+        self.canvas.update()
+
     def timeline_frames(self):
-        return compose_timeline_frames(self.layers,self.size_px,self.regions,self.frames.value(),self.frame_edits)
+        return compose_layer_motion_frames(self.layers,self.size_px,self.regions,self.frames.value(),self.frame_edits,self.layer_motion_keys,self.motion_keys)
     def show_timeline_frame(self,*args):
         self.stop_preview();self.timeline_mode=True
         self.frame_label.setText(f'Frame {self.frame_slider.value()+1} / {self.frames.value()}')
-        self.canvas.update()
+        self.refresh_motion_summary();self.refresh_layer_motion();self.canvas.update()
     def timeline_count_changed(self,*args):
         self.frame_slider.setMaximum(self.frames.value()-1)
         self.frame_label.setText(f'Frame {self.frame_slider.value()+1} / {self.frames.value()}')
-        self.canvas.update()
+        self.refresh_timeline_markers();self.canvas.update()
     def enable_timeline(self):
         self.stop_preview();self.timeline_mode=True;self.canvas.update()
     def step_frame(self,step):
@@ -351,12 +813,14 @@ class MainWindow(QMainWindow):
     def duplicate_frame(self):
         i=self.frame_slider.value()
         if i==0:return
-        self.checkpoint();self.frame_edits[str(i)]=[list(p) for p in self.frame_edits.get(str(i-1),[])]
+        self.checkpoint();track=self.frame_tracks[self.track_selector.currentText()]
+        track[str(i)]=[list(p) for p in track.get(str(i-1),[])]
+        self.sync_frame_edits()
         self.enable_timeline()
     def clear_frame(self):
-        if str(self.frame_slider.value()) in self.frame_edits:
+        if str(self.frame_slider.value()) in self.frame_tracks[self.track_selector.currentText()]:
             if QMessageBox.question(self,'Clear frame edits?','Remove the hand-drawn changes on this frame?',QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
-        self.checkpoint();self.frame_edits.pop(str(self.frame_slider.value()),None)
+        self.checkpoint();self.frame_tracks[self.track_selector.currentText()].pop(str(self.frame_slider.value()),None);self.sync_frame_edits()
         self.enable_timeline()
     def selected_layer(self):
         i=self.layer_list.currentRow();return self.layers[i] if 0<=i<len(self.layers) else None
@@ -394,12 +858,18 @@ class MainWindow(QMainWindow):
     def move_layer(self,d):
         i=self.layer_list.currentRow();j=i+d
         if not 0<=i<len(self.layers) or not 0<=j<len(self.layers):return
-        self.checkpoint();self.layers[i],self.layers[j]=self.layers[j],self.layers[i];item=self.layer_list.takeItem(i);self.layer_list.insertItem(j,item);self.layer_list.setCurrentRow(j);self.invalidate()
+        self.checkpoint();self.layers[i],self.layers[j]=self.layers[j],self.layers[i]
+        keys_i=self.layer_motion_keys.pop(str(i),None);keys_j=self.layer_motion_keys.pop(str(j),None)
+        if keys_i is not None:self.layer_motion_keys[str(j)]=keys_i
+        if keys_j is not None:self.layer_motion_keys[str(i)]=keys_j
+        item=self.layer_list.takeItem(i);self.layer_list.insertItem(j,item);self.layer_list.setCurrentRow(j);self.invalidate()
     def remove_layer(self):
         i=self.layer_list.currentRow()
         if i>=0:
             if QMessageBox.question(self,'Delete layer?','Remove the selected layer? You can undo this with Ctrl+Z.',QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
-            self.checkpoint();self.layers.pop(i);self.layer_list.takeItem(i);self.invalidate()
+            self.checkpoint();self.layers.pop(i)
+            self.layer_motion_keys={str(int(k)-(int(k)>i)):v for k,v in self.layer_motion_keys.items() if int(k)!=i}
+            self.layer_list.takeItem(i);self.invalidate()
     def add_region(self,rect):
         self.checkpoint();r=Region(f'Region {len(self.regions)+1}',rect);self.regions.append(r);self.region_list.addItem(r.name);self.region_list.setCurrentRow(len(self.regions)-1);self.invalidate()
     def delete_region(self):
@@ -450,8 +920,39 @@ class MainWindow(QMainWindow):
         i=self.region_list.currentRow()
         if 0<=i<len(self.regions):self.regions[i].effect=self.effect.currentText();self.regions[i].strength=self.strength.value();self.regions[i].direction=self.laser_direction.currentText();self.regions[i].beam_length=self.laser_length.value();self.regions[i].particle_count=self.particles.value();self.regions[i].speed=self.gush_speed.value();self.regions[i].start_frame=self.start_frame.value();self.regions[i].active_frames=self.active_frames.value();self.regions[i].cycle_frames=self.cycle_frames.value();self.regions[i].phase_offset=self.phase_offset.value();self.regions[i].repeat=self.repeat_effect.isChecked();self.invalidate()
     def make_frames(self):return self.timeline_frames()
+    def begin_highlighting(self):
+        if not self.regions:
+            self.add_region((0,0,*self.size_px))
+        elif self.region_list.currentRow()<0:
+            self.region_list.setCurrentRow(0)
+        self.timeline_mode=False
+        self.tool.setCurrentText('Mask Brush')
+        self.animator_dock.show()
+        self.statusBar().showMessage('Paint green highlights on the sprite, choose an effect, then press Preview.',8000)
+
     def start_preview(self):
-        self.preview=self.make_frames();self.index=0;self.timer.start(self.duration.value());self.canvas.update()
+        if not self.layers:
+            self.preview_hint.setText('Import a PNG or create a paint layer before previewing.')
+            self.statusBar().showMessage('Import artwork first to preview an animation.',5000)
+            return
+        if not self.regions:
+            self.preview_hint.setText('Click Highlight to animate, paint on the sprite, then preview.')
+            self.statusBar().showMessage('Choose the pixels to animate first.',5000)
+            return
+        if not any(r.mask for r in self.regions):
+            self.preview_hint.setText('No pixels highlighted yet! Click Highlight to animate and paint on your sprite.')
+            self.statusBar().showMessage('Paint highlights over the part you want moving.',6000)
+            return
+        self.timer.stop()
+        self.preview=self.make_frames()
+        if len(self.preview)<2:
+            self.preview_hint.setText('Not enough frames to play. Increase the frame count.')
+            return
+        self.timeline_mode=False
+        self.index=0
+        self.preview_hint.setText('▶ Playing on the main canvas — press Stop to edit.')
+        self.timer.start(self.duration.value())
+        self.canvas.update()
     def next_frame(self):
         if self.preview:self.index=(self.index+1)%len(self.preview);self.canvas.update()
     def apply_speed_preset(self,index):
@@ -461,19 +962,101 @@ class MainWindow(QMainWindow):
         ms=self.duration.value();count=self.frames.value()
         self.fps_label.setText(f'{1000/ms:.1f} FPS')
         self.total_duration_label.setText(f'{count*ms/1000:.2f} seconds ({count} frames)')
+    def update_export_tip(self,*args):
+        descriptions=[
+            '✨ APNG: full-color moving sprite with transparency. Open in a browser or animation-capable viewer.',
+            '🎞 GIF: moving sprite for easy sharing; 256-color limit and 10 ms timing steps.',
+            '▦ Sprite sheet: one wide PNG containing every frame. It will NOT play by itself.',
+            '🖼 Still PNG: saves ONE frame only. It will NOT animate.',
+        ]
+        if hasattr(self,'export_tip'):
+            self.export_tip.setText(descriptions[self.export_format.currentIndex()])
+
+    def export_choose_formats(self):
+        """One export action with independently selectable APNG, GIF, and still PNG."""
+        dialog=QDialog(self)
+        dialog.setWindowTitle('Export your sprite ✨')
+        layout=QVBoxLayout(dialog)
+        intro=QLabel('Choose one, two, or all three formats. Animated files use the same preview frames.')
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        apng=QCheckBox('✨ Animated PNG (APNG) — full-color, transparent, moving')
+        gif=QCheckBox('🎞 Animated GIF — moving, easy to share')
+        still=QCheckBox('🖼 Still PNG — one frame, does not move')
+        for check in (apng,gif,still):
+            check.setChecked(True)
+            layout.addWidget(check)
+        note=QLabel('All three are selected by default. Uncheck anything you do not want.')
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('Export selected formats')
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec()!=QDialog.DialogCode.Accepted:return
+        selected=[apng.isChecked(),gif.isChecked(),still.isChecked()]
+        if not any(selected):
+            QMessageBox.information(self,'Nothing selected','Select at least one export format.')
+            return
+        folder=QFileDialog.getExistingDirectory(self,'Choose a folder for your exported sprite')
+        if not folder:return
+        name,ok=QInputDialog.getText(self,'Sprite filename','Base filename (without extension):',text='my_sprite')
+        if not ok:return
+        name=name.strip()
+        if not name or name in ('.','..') or any(c in name for c in '/\\\\:*?"<>|'):
+            QMessageBox.warning(self,'Invalid filename','Please enter a simple filename without slashes or special characters.')
+            return
+        output=Path(folder)
+        paths=[output/(name+suffix) for chosen,suffix in zip(selected,('_animated.png','_animated.gif','_still.png')) if chosen]
+        if any(path.exists() for path in paths):
+            answer=QMessageBox.question(self,'Replace existing files?',
+                'One or more selected files already exist. Replace them?',
+                QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer!=QMessageBox.StandardButton.Yes:return
+        frames=self.make_frames() if selected[0] or selected[1] else []
+        saved=[]
+        errors=[]
+        operations=[
+            (selected[0],output/(name+'_animated.png'),lambda path:export_apng(frames,path,self.duration.value(),self.loop_count.value())),
+            (selected[1],output/(name+'_animated.gif'),lambda path:export_gif(frames,path,self.duration.value(),self.loop_count.value())),
+            (selected[2],output/(name+'_still.png'),lambda path:composite(self.layers,self.size_px).save(path)),
+        ]
+        for enabled,path,write in operations:
+            if not enabled:continue
+            try:
+                write(path)
+                if path.name.endswith('_animated.gif') or path.name.endswith('_animated.png'):
+                    with Image.open(path) as check:
+                        if getattr(check,'n_frames',1)<2:
+                            raise RuntimeError('File contains only one frame; choose an effect that changes over time.')
+                saved.append(path.name)
+            except Exception as exc:
+                errors.append(f'{path.name}: {exc}')
+        if errors:
+            QMessageBox.warning(self,'Export needs attention',
+                ('Saved: '+', '.join(saved)+'\\n\\n' if saved else '')+'\\n'.join(errors))
+        else:
+            QMessageBox.information(self,'Your sprite is exported! 🎉',
+                'Saved to '+str(output)+'\\n\\n'+'\\n'.join(saved))
+
+    def save_gif(self):
+        path,_=QFileDialog.getSaveFileName(self,'Export moving GIF','animation.gif','Animated GIF (*.gif)')
+        if not path:return
+        try:
+            export_gif(self.make_frames(),path,self.duration.value(),self.loop_count.value())
+            with Image.open(path) as check:
+                if getattr(check,'n_frames',1)<2:raise RuntimeError('GIF contains only one frame')
+            QMessageBox.information(self,'Moving GIF exported',f'Animated GIF saved to {path}\nOpen in a browser to see it move.')
+        except Exception as e:QMessageBox.warning(self,'GIF export failed',str(e))
+
     def export_selected_format(self):
         selected=self.export_format.currentIndex()
         if selected==0:return self.save_apng()
         if selected==3:return self.save_png()
         frames=self.make_frames()
-        if selected==1:
-            path,_=QFileDialog.getSaveFileName(self,'Export animated GIF','animation.gif','GIF (*.gif)')
-            if not path:return
-            try:
-                export_gif(frames,path,self.duration.value(),self.loop_count.value())
-                QMessageBox.information(self,'GIF exported',f'Saved {path}\nNote: GIF has a limited color palette.')
-            except Exception as e:QMessageBox.warning(self,'GIF export failed',str(e))
-            return
+        if selected==1:return self.save_gif()
         if selected==2:
             path,_=QFileDialog.getSaveFileName(self,'Export sprite sheet','sprite_sheet.png','PNG (*.png)')
             if not path:return
@@ -482,13 +1065,17 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self,'Sprite sheet exported',f'Saved {len(frames)} frames to {path}')
             except Exception as e:QMessageBox.warning(self,'Sprite sheet export failed',str(e))
     def save_apng(self):
-        path,_=QFileDialog.getSaveFileName(self,'Export APNG','animation.apng','APNG (*.apng)')
+        path,_=QFileDialog.getSaveFileName(self,'Export moving APNG','animation.png','Animated PNG (*.png *.apng)')
         if path:
-            try:export_apng(self.make_frames(),path,self.duration.value(),self.loop_count.value());QMessageBox.information(self,'Export verified',f'Saved {path}')
+            try:export_apng(self.make_frames(),path,self.duration.value(),self.loop_count.value());QMessageBox.information(self,'Moving APNG exported',f'Animated PNG saved to {path}\nThis is an animated PNG (APNG), even if the filename ends in .png. Open in a browser to see it move.')
             except Exception as e:QMessageBox.warning(self,'Animation export',str(e))
     def save_png(self):
-        path,_=QFileDialog.getSaveFileName(self,'Export PNG','sprite.png','PNG (*.png)')
-        if path:composite(self.layers,self.size_px).save(path)
+        path,_=QFileDialog.getSaveFileName(self,'Export STILL image (no animation)','sprite_still.png','Still PNG (*.png)')
+        if path:
+            if QMessageBox.question(self,'Export a still image?',
+                'A still PNG will NOT move. For animation, use Export MOVING Sprite (APNG) or Export MOVING GIF.\n\nSave one still frame anyway?',
+                QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
+            composite(self.layers,self.size_px).save(path)
     def open_worksheet(self):
         path,_=QFileDialog.getOpenFileName(self,'Open NFT worksheet','','Worksheets (*.xlsx *.csv)')
         if not path:return
@@ -564,8 +1151,14 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self,'Metadata created',f'Created {len(entries)} unique trait combinations.\n{path}\n{csvpath}\n\nNote: metadata only; artwork batch compositing is not implemented yet.')
         except Exception as e:QMessageBox.warning(self,'Generation failed',str(e))
     def snapshot(self):
-        return capture(self.size_px,self.layers,self.regions,self.traits,self.frame_edits,
-                       self.frames.value(),self.duration.value(),self.loop_count.value(),self.export_format.currentIndex())
+        obj=capture(self.size_px,self.layers,self.regions,self.traits,self.frame_edits,
+                    self.frames.value(),self.duration.value(),self.loop_count.value(),self.export_format.currentIndex())
+        obj['pet_anchors']=json.loads(json.dumps(self.pet_anchors))
+        obj['frame_tracks']=json.loads(json.dumps(self.frame_tracks))
+        obj['motion_keys']=json.loads(json.dumps(self.motion_keys))
+        obj['layer_motion_keys']=json.loads(json.dumps(self.layer_motion_keys))
+        obj['frame_clips']=json.loads(json.dumps(self.frame_clips))
+        return obj
 
     def checkpoint(self):
         if not self._restoring:
@@ -577,7 +1170,14 @@ class MainWindow(QMainWindow):
         self._restoring=True
         try:
             self.size_px=size;self.layers=layers;self.regions=regions
-            self.traits=obj.get('traits',{});self.frame_edits=obj.get('frame_edits',{})
+            self.traits=obj.get('traits',{});self.frame_edits=obj.get('frame_edits',{});self.pet_anchors=obj.get('pet_anchors',{})
+            self.frame_tracks=obj.get('frame_tracks') or {'Ink':json.loads(json.dumps(self.frame_edits))}
+            self.motion_keys=obj.get('motion_keys',{})
+            self.layer_motion_keys=obj.get('layer_motion_keys',{})
+            self.frame_clips=obj.get('frame_clips',{})
+            self.clip_selector.clear();self.clip_selector.addItems(list(self.frame_clips))
+            self.track_selector.blockSignals(True);self.track_selector.clear();self.track_selector.addItems(list(self.frame_tracks));self.track_selector.blockSignals(False)
+            self.sync_frame_edits();self.refresh_motion_summary();self.refresh_layer_motion()
             self.frames.setValue(obj.get('frame_count',8));self.duration.setValue(obj.get('frame_duration',100))
             self.loop_count.setValue(obj.get('animation_loops',0));self.export_format.setCurrentIndex(obj.get('export_format',0))
             self.timeline_mode=bool(self.frame_edits)
@@ -585,7 +1185,7 @@ class MainWindow(QMainWindow):
             self.region_list.clear();self.region_list.addItems([r.name for r in regions])
             if layers:self.layer_list.setCurrentRow(len(layers)-1)
             if regions:self.region_list.setCurrentRow(0)
-            self.refresh_traits();self.invalidate()
+            self.refresh_traits();self.refresh_pet_anchors();self.invalidate()
         finally:
             self._restoring=False
 
