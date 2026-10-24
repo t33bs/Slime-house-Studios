@@ -296,7 +296,6 @@ class MainWindow(QMainWindow):
         self.animator_dock.visibilityChanged.connect(self.animator_visibility_changed)
         self._tool_sizes = {name: 1 for name in self.SIZABLE_TOOLS}
         self.brush.valueChanged.connect(self._remember_active_tool_size)
-        self.mask_brush.valueChanged.connect(self._remember_active_tool_size)
         self.tool.currentTextChanged.connect(self.activate_tool)
         self.advanced_animator_dock=QDockWidget('Intermediate Studio — Timeline Studio',self)
         self.advanced_animator_dock.setObjectName('AdvancedAnimatorDock')
@@ -330,6 +329,7 @@ class MainWindow(QMainWindow):
         self.advanced_layout.addWidget(QLabel('Frame-by-frame editing for longer GIFs and animated sprites.'))
         self.advanced_layout.addWidget(QLabel('Both animators share the same artwork, regions, and animation frames.'))
         self.mask_brush=QSpinBox();self.mask_brush.setRange(1,32);self.mask_brush.setValue(1);av.addWidget(QLabel('Mask brush size'));av.addWidget(self.mask_brush)
+        self.mask_brush.valueChanged.connect(self._remember_active_tool_size)
         self.region_list=QListWidget();self.region_list.currentRowChanged.connect(self.update_region_controls);av.addWidget(self.region_list)
         self.effect=QComboBox();self.effect.addItems(EFFECTS);self.effect.currentIndexChanged.connect(self.apply_region_controls)
         self.strength=QSpinBox();self.strength.setRange(1,40);self.strength.setValue(2);self.strength.valueChanged.connect(self.apply_region_controls)
