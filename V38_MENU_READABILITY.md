@@ -1,0 +1,1 @@
+v38: Increase File/Edit/View menu font to 16px, dropdown menu text to 15px, combo selections to 15px, tooltip to 14px and baseline text to 14px. Preserve existing features. Desktop Pet Builder guided-workflow redesign remains planned, not implemented in this release.

@@ -24,9 +24,16 @@ Keep the native Python/PySide6 Windows desktop app. All new features are additiv
 - Movement anchors and rig compatibility, pose transitions
 - Non-destructive per-frame transforms, reset and eraser tools
 
-## Phase 3 — Desktop Pet Builder (PLANNED)
-- Creature templates, sprite state machine (idle/walk/sleep/etc.), accessories and anchoring
-- Pet preview, behavior configuration, animation asset export
+## Phase 3 — Desktop Pet Builder (IN PROGRESS — v40)
+- [x] Existing creature templates, body-part regions, anchors and starter-motion generator
+- [x] 31 everyday-life animation recipes and additional battle recipes
+- [x] v39 simplified Step-by-Step / Advanced layout
+- [x] v40 context-sensitive pose drawing, preview, and export navigation
+- [x] v40 optional per-recipe step checkmarks (current session only)
+- [ ] Illustrated pose references and visual region-selection tools
+- [ ] Persistent creature animation-state library and editable rigging workflow
+- [ ] Integrated creature preview, export validation and Windows GUI QA
+- [ ] Battle-animation workflow refinement without adding gameplay to Studio
 
 ## Phase 4 — Variation and evolution workflow (PLANNED)
 - Recolor/material/element variations and creature family organization

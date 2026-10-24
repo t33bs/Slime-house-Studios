@@ -19,12 +19,12 @@ def qimage(im):
 # The small crosshair is the exact canvas interaction point (hotspot 3,3).
 CURSOR_SYMBOLS={
     'Pencil':'✎','Eraser':'⌫','Mask Brush':'✦','Mask Eraser':'◇',
-    'Frame Pencil':'✎','Frame Eraser':'⌫','Eyedropper':'◉','Animation Region':'▭','Pose Anchor':'⌖',
+    'Frame Pencil':'✎','Frame Eraser':'⌫','Pet Region Select':'▭','Eyedropper':'◉','Animation Region':'▭','Pose Anchor':'⌖',
 }
 CURSOR_COLORS={
     'Pencil':'#ffe3a1','Eraser':'#ffb6b6','Mask Brush':'#91e6bb',
     'Mask Eraser':'#a7d3ff','Frame Pencil':'#f5cf9c',
-    'Frame Eraser':'#ffb9bd','Eyedropper':'#c4b5fd','Animation Region':'#d5bbef','Pose Anchor':'#ffdc8b',
+    'Frame Eraser':'#ffb9bd','Pet Region Select':'#7de4b3','Eyedropper':'#c4b5fd','Animation Region':'#d5bbef','Pose Anchor':'#ffdc8b',
 }
 
 def cursor_for_tool(tool):
@@ -90,6 +90,16 @@ class Canvas(QWidget):
                 for px,py in reg.mask:p.fillRect(self.rect_screen((px,py,1,1)),QColor(125,232,181,135))
             if self.drag and self.drag[0]=='region':
                 a=self.drag[1];b=self.drag[2];p.setPen(QPen(QColor('#f3d3fc'),2));p.drawRect(self.rect_screen((min(a[0],b[0]),min(a[1],b[1]),abs(a[0]-b[0])+1,abs(a[1]-b[1])+1)))
+        # Show editable pet body-part boxes without adding another crowded panel.
+        if hasattr(m,'pet_regions') and (m.tool.currentText()=='Pet Region Select' or getattr(m,'pet_region_overlay_enabled',False)):
+            for name,rect in m.pet_regions.items():
+                p.setPen(QPen(QColor('#7de4b3'),2))
+                screen=self.rect_screen(rect);p.drawRect(screen)
+                p.drawText(screen.left()+3,max(12,screen.top()-4),name)
+            if self.drag and self.drag[0]=='pet-region':
+                a,b=self.drag[1:3]
+                rect=(min(a[0],b[0]),min(a[1],b[1]),abs(a[0]-b[0])+1,abs(a[1]-b[1])+1)
+                p.setPen(QPen(QColor('#ffe4a0'),2));p.drawRect(self.rect_screen(rect))
         if m.tool.currentText()=='Pose Anchor' or (hasattr(m,'show_pet_anchors') and m.show_pet_anchors.isChecked()):
             p.setRenderHint(QPainter.RenderHint.Antialiasing,False)
             for name,xy in m.pet_anchors.get(m.pet_pose.currentText(),{}).items():
@@ -121,8 +131,26 @@ class Canvas(QWidget):
         self.zoom_factor=1.0;self.zoom_focus=None;self.update()
 
     def mousePressEvent(self,e):
-        if e.button()!=Qt.MouseButton.LeftButton:return
+        if e.button() not in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):return
         m=self.main;x,y=self.coord(e.position());l=m.selected_layer();tool=m.tool.currentText()
+        # Right-click erases temporarily in the current drawing context.
+        # It does not change the selected tool, color, or brush size.
+        if e.button()==Qt.MouseButton.RightButton:
+            context=m._drawing_context()
+            if tool in ('Eyedropper','Move / Transform','Pose Anchor','Animation Region'):
+                context=getattr(m,'last_drawing_context','base')
+            if not (0<=x<m.size_px[0] and 0<=y<m.size_px[1]):return
+            if context=='base' and l is None:return
+            if context=='mask' and not (0<=m.region_list.currentRow()<len(m.regions)):return
+            m.checkpoint();self.drag=['right-erase',context]
+            self.erase_at(x,y,context)
+            e.accept();return
+        if tool=='Pet Region Select':
+            if m.pet_template_path.text().strip():
+                m.statusBar().showMessage('Clear the separate template path to select regions on the canvas.',4000);return
+            if 0<=x<m.size_px[0] and 0<=y<m.size_px[1]:
+                self.drag=['pet-region',(x,y),(x,y)];self.update()
+            return
         if tool=='Eyedropper':
             self.sample_color_at(x,y);return
         if tool=='Pose Anchor':
@@ -150,6 +178,17 @@ class Canvas(QWidget):
         elif abs(mx-r.right())<14 and abs(my-r.bottom())<14:mode='scale'
         else:mode='move'
         m.checkpoint();self.drag=[mode,x,y,l.x,l.y,l.scale,l.angle]
+    def erase_at(self,x,y,context):
+        """Erase on right-drag without changing the active tool or color."""
+        m=self.main
+        if not (0<=x<m.size_px[0] and 0<=y<m.size_px[1]):return
+        if context=='frame':
+            self.frame_paint_at(x,y,erase=True)
+        elif context=='mask':
+            self.mask_at(x,y,erase=True)
+        else:
+            self.paint_at(x,y,erase=True)
+
     def sample_color_at(self,x,y):
         """Pick a visible, opaque pixel without altering artwork or undo history."""
         m=self.main
@@ -162,6 +201,11 @@ class Canvas(QWidget):
         m.statusBar().showMessage(f'Picked color #{rgba[0]:02X}{rgba[1]:02X}{rgba[2]:02X} (alpha {rgba[3]})',2500)
         # Restore the drawing tool after a one-click sample.
         previous=getattr(m,'eyedropper_previous_tool','Pencil')
+        # Sampling is a drawing operation: return to the brush, never an eraser.
+        # Preserve the animation editing context (base / frame / mask).
+        brush_for_eraser={'Eraser':'Pencil','Frame Eraser':'Frame Pencil',
+                          'Mask Eraser':'Mask Brush'}
+        previous=brush_for_eraser.get(previous,previous)
         if previous=='Eyedropper':previous='Pencil'
         m.tool.setCurrentText(previous)
         self.update()
@@ -174,13 +218,13 @@ class Canvas(QWidget):
         m.pet_anchors.setdefault(pose,{})[name]=[x,y]
         m.refresh_pet_anchors();self.update()
 
-    def frame_paint_at(self,x,y):
+    def frame_paint_at(self,x,y,erase=False):
         m=self.main
         if not 0<=x<m.size_px[0] or not 0<=y<m.size_px[1]:return
         index=m.frame_slider.value()
         strokes=m.frame_tracks.setdefault(m.track_selector.currentText(),{}).setdefault(str(index),[])
         radius=m.brush.value()
-        color=(0,0,0,0) if m.tool.currentText()=='Frame Eraser' else m.paint_color
+        color=(0,0,0,0) if erase or m.tool.currentText()=='Frame Eraser' else m.paint_color
         # Last edit wins, and strokes remain editable in the saved project.
         positions={(int(st[0]),int(st[1])):st for st in strokes}
         for yy in range(y-radius+1,y+radius):
@@ -191,7 +235,7 @@ class Canvas(QWidget):
         m.sync_frame_edits()
         m.timeline_mode=True;m.stop_preview();m.canvas.update()
 
-    def mask_at(self,x,y):
+    def mask_at(self,x,y,erase=False):
         m=self.main;idx=m.region_list.currentRow()
         if not 0<=idx<len(m.regions):
             if m.tool.currentText()=='Mask Brush':
@@ -204,21 +248,24 @@ class Canvas(QWidget):
         for yy in range(y-radius+1,y+radius):
             for xx in range(x-radius+1,x+radius):
                 if 0<=xx<m.size_px[0] and 0<=yy<m.size_px[1]:
-                    if m.tool.currentText()=='Mask Eraser':pixels.discard((xx,yy))
+                    if erase or m.tool.currentText()=='Mask Eraser':pixels.discard((xx,yy))
                     else:pixels.add((xx,yy))
         reg.mask=[list(pt) for pt in sorted(pixels)]
         m.invalidate()
-    def paint_at(self,x,y):
+    def paint_at(self,x,y,erase=False):
         m=self.main;l=m.selected_layer()
         if l is None:return
         if not (0 <= x < m.size_px[0] and 0 <= y < m.size_px[1]):return
         if l.angle%360 or l.scale!=1:
             m.statusBar().showMessage('Pixel painting requires layer scale 100% and rotation 0°',3000);return
-        paint_pixel(l,x-l.x,y-l.y,m.paint_color,m.brush.value(),m.tool.currentText()=='Eraser');m.invalidate()
+        paint_pixel(l,x-l.x,y-l.y,m.paint_color,m.brush.value(),erase or m.tool.currentText()=='Eraser');m.invalidate()
     def mouseMoveEvent(self,e):
         if not self.drag:return
         m=self.main;x,y=self.coord(e.position());mode=self.drag[0]
-        if mode=='region':self.drag[2]=(x,y);self.update();return
+        if mode=='right-erase':
+            if e.buttons() & Qt.MouseButton.RightButton:self.erase_at(x,y,self.drag[1])
+            return
+        if mode in ('region','pet-region'):self.drag[2]=(x,y);self.update();return
         if mode=='anchor':self.place_anchor(x,y);return
         if mode=='paint':self.paint_at(x,y);return
         if mode=='framepaint':self.frame_paint_at(x,y);return
@@ -231,6 +278,14 @@ class Canvas(QWidget):
         elif mode=='rotate':l.angle=(angle+(x-sx)*5)%360
         m.update_layer_controls();m.invalidate()
     def mouseReleaseEvent(self,e):
+        if self.drag and self.drag[0]=='pet-region':
+            a,b=self.drag[1:3];m=self.main
+            w,h=m.size_px
+            ax=max(0,min(w-1,a[0]));ay=max(0,min(h-1,a[1]))
+            bx=max(0,min(w-1,b[0]));by=max(0,min(h-1,b[1]))
+            rect=[min(ax,bx),min(ay,by),abs(ax-bx)+1,abs(ay-by)+1]
+            for spin,value in zip(m.pet_region_spins,rect):spin.setValue(value)
+            m.save_pet_region()
         if self.drag and self.drag[0]=='region':
             a,b=self.drag[1:];x,y=min(a[0],b[0]),min(a[1],b[1]);w,h=abs(a[0]-b[0])+1,abs(a[1]-b[1])+1
             self.main.add_region((x,y,w,h))
@@ -258,7 +313,7 @@ class MainWindow(QMainWindow):
         for text,fn in [('↑',lambda:self.move_layer(1)),('↓',lambda:self.move_layer(-1)),('Delete',self.remove_layer)]:
             b=QPushButton(text);b.clicked.connect(fn);bar.addWidget(b)
         lv.addWidget(QLabel('YOUR ACTIVE TOOL'))
-        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Pencil','Eraser','Eyedropper','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser','Pose Anchor']);lv.addWidget(self.tool)
+        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Pencil','Eraser','Eyedropper','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser','Pose Anchor','Pet Region Select']);lv.addWidget(self.tool)
         self.active_tool_banner=QLabel('↔  Move / Transform  ·  Drag artwork to move it')
         self.active_tool_banner.setObjectName('activeToolBanner')
         self.active_tool_banner.setWordWrap(True)
@@ -470,7 +525,52 @@ class MainWindow(QMainWindow):
         self.pet_workshop_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
         pet_scroll=QScrollArea();pet_scroll.setWidgetResizable(True)
         pet_widget=QWidget();pet_layout=QVBoxLayout(pet_widget)
-        pet_scroll.setWidget(pet_widget);self.pet_workshop_dock.setWidget(pet_scroll)
+        # Two-level workflow: an approachable guide first, existing tools retained in Advanced.
+        pet_tabs=QTabWidget()
+        guide_page=QWidget();guide_page_layout=QVBoxLayout(guide_page)
+        intro=QLabel('Start here: choose a creature, then follow one animation recipe at a time.')
+        intro.setWordWrap(True);guide_page_layout.addWidget(intro)
+        import_button=QPushButton('1. Import a creature PNG')
+        import_button.clicked.connect(self.choose_pet_template)
+        guide_page_layout.addWidget(import_button)
+        rig_builder=QPushButton('🧩 Open Creature Rig & Sprite Sheet Builder')
+        rig_builder.clicked.connect(self.open_creature_rig_builder)
+        guide_page_layout.addWidget(rig_builder)
+        use_canvas=QPushButton('Or use the current canvas')
+        use_canvas.clicked.connect(lambda:self.pet_template_path.clear())
+        guide_page_layout.addWidget(use_canvas)
+        guide_page_layout.addWidget(QLabel('2. Choose an animation'))
+        self.pet_guide_action=QComboBox();self.pet_guide_action.addItems(ANIMATIONS)
+        guide_page_layout.addWidget(self.pet_guide_action)
+        self.pet_guide_progress=QLabel('Step 1')
+        guide_page_layout.addWidget(self.pet_guide_progress)
+        self.pet_guide_title=QLabel();self.pet_guide_title.setWordWrap(True)
+        self.pet_guide_title.setStyleSheet('font-size:17px;font-weight:700;color:#c2f5d1')
+        guide_page_layout.addWidget(self.pet_guide_title)
+        self.pet_guide_instructions=QLabel();self.pet_guide_instructions.setWordWrap(True)
+        guide_page_layout.addWidget(self.pet_guide_instructions)
+        # Contextual action keeps the next useful editor tool one click away.
+        self.pet_guide_tool=QPushButton('Open suggested tool')
+        self.pet_guide_tool.clicked.connect(self.open_pet_guide_tool)
+        guide_page_layout.addWidget(self.pet_guide_tool)
+        self.pet_guide_done=QCheckBox('Mark this step complete')
+        self.pet_guide_done.toggled.connect(self.mark_pet_guide_step)
+        guide_page_layout.addWidget(self.pet_guide_done)
+        guide_nav=QHBoxLayout()
+        self.pet_guide_back=QPushButton('← Back');self.pet_guide_back.clicked.connect(lambda:self.move_pet_guide(-1))
+        self.pet_guide_next=QPushButton('Next step →');self.pet_guide_next.clicked.connect(lambda:self.move_pet_guide(1))
+        guide_nav.addWidget(self.pet_guide_back);guide_nav.addWidget(self.pet_guide_next)
+        guide_page_layout.addLayout(guide_nav)
+        self.pet_guide_show_advanced=QPushButton('Show detailed tools / export →')
+        self.pet_guide_show_advanced.clicked.connect(lambda:pet_tabs.setCurrentIndex(1))
+        guide_page_layout.addWidget(self.pet_guide_show_advanced)
+        guide_page_layout.addStretch()
+        self.pet_guide_step=0
+        self.pet_guide_action.currentTextChanged.connect(self.pet_guide_animation_changed)
+        pet_tabs.addTab(guide_page,'Create • Step by Step')
+        pet_tabs.addTab(pet_scroll,'Advanced / Export')
+        self.pet_workshop_dock.setWidget(pet_tabs)
+        self.pet_studio_tabs=pet_tabs
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,self.pet_workshop_dock)
         self.pet_workshop_button.clicked.connect(self.toggle_pet_workshop)
         self.pet_workshop_dock.visibilityChanged.connect(self.pet_workshop_visibility_changed)
@@ -508,6 +608,10 @@ class MainWindow(QMainWindow):
             if caption in ('Width','Height'):spin.setValue(8)
             region_form.addRow(caption,spin);self.pet_region_spins.append(spin)
         rig_layout.addLayout(region_form)
+        visual_region=QPushButton('Draw selected body part on canvas')
+        visual_region.setToolTip('Choose a body part above, then drag a rectangle on the main canvas. Its pixel coordinates save automatically.')
+        visual_region.clicked.connect(self.activate_pet_region_selector)
+        rig_layout.addWidget(visual_region)
         add_region=QPushButton('Save marked part');add_region.clicked.connect(self.save_pet_region)
         remove_region=QPushButton('Remove selected part');remove_region.clicked.connect(self.remove_pet_region)
         rig_layout.addWidget(add_region);rig_layout.addWidget(remove_region)
@@ -557,6 +661,7 @@ class MainWindow(QMainWindow):
         self.pet_recipe_group=guide_group
         self.pet_recipe_group.setVisible(self.pet_suggestions_toggle.isChecked())
         self.update_pet_animation_recipe()
+        self.refresh_pet_guide()
 
         self.pet_export_frames=QCheckBox('Individual PNG frames');self.pet_export_frames.setChecked(True)
         self.pet_export_gif=QCheckBox('GIF previews');self.pet_export_gif.setChecked(True)
@@ -667,7 +772,14 @@ class MainWindow(QMainWindow):
         self.activate_tool(self.tool.currentText())
         QTimer.singleShot(0,self.offer_recovery)
         self.statusBar().showMessage('Ready — import a PNG or create a layer. Choose Junior for quick effects or Intermediate for timeline editing.')
-        self.setStyleSheet('''QWidget{background:#1b222e;color:#d8e3e5;font-family:"Segoe UI";font-size:13px}
+        self.setStyleSheet('''QWidget{background:#1b222e;color:#d8e3e5;font-family:"Segoe UI";font-size:14px}
+        QMenuBar{font-size:16px;padding:3px 5px}
+        QMenuBar::item{padding:6px 10px}
+        QMenu{font-size:15px;padding:5px}
+        QMenu::item{padding:7px 22px}
+        QComboBox{font-size:15px;min-height:24px}
+        QComboBox QAbstractItemView{font-size:15px;selection-background-color:#496d65}
+        QToolTip{font-size:14px;background:#2b3544;color:#e2f3ea;border:1px solid #638d7c;padding:5px}
         QPushButton,QComboBox,QSpinBox,QDoubleSpinBox,QListWidget,QTabWidget::pane{background:#2b3544;border:1px solid #445064;border-radius:7px;padding:6px}
         QPushButton:hover{background:#3c5260;border-color:#83d7b0}
         QPushButton:pressed{background:#467c6b}
@@ -771,7 +883,8 @@ class MainWindow(QMainWindow):
 
     def activate_eyedropper(self):
         current=self.tool.currentText()
-        if current!='Eyedropper':self.eyedropper_previous_tool=current
+        if current!='Eyedropper':
+            self.eyedropper_previous_tool=current
         self.tool.setCurrentText('Eyedropper')
         self.statusBar().showMessage('Eyedropper: click a visible pixel to pick its color.',3000)
 
@@ -871,6 +984,11 @@ class MainWindow(QMainWindow):
         if self.pet_workshop_dock.isVisible():self.pet_workshop_dock.hide()
         else:self.pet_workshop_dock.show();self.pet_workshop_dock.raise_()
 
+    def open_creature_rig_builder(self):
+        from .rig_builder_ui import RigBuilderDialog
+        dialog=RigBuilderDialog(self,self.size_px)
+        dialog.exec()
+
     def choose_pet_template(self):
         path,_=QFileDialog.getOpenFileName(self,'Choose pet template','','PNG Images (*.png)')
         if path:self.pet_template_path.setText(path)
@@ -886,6 +1004,84 @@ class MainWindow(QMainWindow):
             self.pet_recipe_text.setText(format_animation_guide(guide))
         except Exception as exc:
             self.pet_recipe_text.setText(str(exc))
+
+    def pet_guide_animation_changed(self, action):
+        self.pet_guide_step=0
+        if hasattr(self,'pet_recipe_action'):
+            self.pet_recipe_action.setCurrentText(action)
+        self.refresh_pet_guide()
+
+    def mark_pet_guide_step(self, checked):
+        if not hasattr(self, '_pet_guide_completed'):
+            self._pet_guide_completed={}
+        action=self.pet_guide_action.currentText()
+        completed=self._pet_guide_completed.setdefault(action,set())
+        if checked: completed.add(self.pet_guide_step)
+        else: completed.discard(self.pet_guide_step)
+
+    def open_pet_guide_tool(self):
+        """Activate only the tool needed by the current recipe step."""
+        guide=animation_guide(self.pet_guide_action.currentText(),
+                              self.pet_wizard_frames.value(),self.pet_body_type.currentText())
+        if 1 <= self.pet_guide_step <= len(guide['key_poses']):
+            self.tool.setCurrentText('Frame Pencil')
+            self.advanced_animator_dock.show()
+            self.advanced_animator_dock.raise_()
+        elif self.pet_guide_step == len(guide['key_poses'])+1:
+            self.advanced_animator_dock.show()
+            self.advanced_animator_dock.raise_()
+        elif self.pet_guide_step == len(guide['key_poses'])+2:
+            self.pet_studio_tabs.setCurrentIndex(1)
+
+    def move_pet_guide(self, delta):
+        guide=animation_guide(self.pet_guide_action.currentText(),
+                              self.pet_wizard_frames.value(),self.pet_body_type.currentText())
+        self.pet_guide_step=max(0,min(len(guide['key_poses'])+2,self.pet_guide_step+delta))
+        self.refresh_pet_guide()
+
+    def refresh_pet_guide(self):
+        if not hasattr(self,'pet_guide_title') or not hasattr(self,'pet_wizard_frames'):
+            return
+        guide=animation_guide(self.pet_guide_action.currentText(),
+                              self.pet_wizard_frames.value(),self.pet_body_type.currentText())
+        stages=guide['key_poses']
+        index=self.pet_guide_step
+        total=len(stages)+3
+        if index==0:
+            title='Prepare your creature'
+            details=f"Import a PNG or use the current canvas. For this animation, prepare: {guide['parts_to_prepare']}."
+        elif index<=len(stages):
+            title=f"Draw pose {index}: {stages[index-1]}"
+            details=(f"Create or edit the '{stages[index-1]}' pose using Frame Pencil and duplicate frames as needed. "
+                     f"Recipe tip: {guide['drawing_tip']}")
+        elif index==len(stages)+1:
+            title='Preview and refine the timing'
+            details=(f"Check the motion in Intermediate Studio. Suggested playback: {guide['playback']}. "
+                     'Adjust frames and redraw any parts that do not move naturally.')
+        else:
+            title='Export your sprite sheet'
+            details='Open Advanced / Export to save frames, sprite sheet, GIF, APNG and JSON. Export is never blocked by this guide.'
+        self.pet_guide_progress.setText(f"Step {index+1} of {total} • {guide['action']}")
+        self.pet_guide_title.setText(title)
+        self.pet_guide_instructions.setText(details)
+        self.pet_guide_back.setEnabled(index>0)
+        self.pet_guide_next.setEnabled(index<total-1)
+        labels=['Import or select your creature']+['Open Frame Pencil for this pose']*len(stages)+['Open Intermediate Studio to preview','Open export options']
+        self.pet_guide_tool.setText(labels[index])
+        self.pet_guide_tool.setEnabled(index!=0)
+        completed=getattr(self,'_pet_guide_completed',{}).get(self.pet_guide_action.currentText(),set())
+        self.pet_guide_done.blockSignals(True)
+        self.pet_guide_done.setChecked(index in completed)
+        self.pet_guide_done.blockSignals(False)
+        self.pet_guide_progress.setText(f"Step {index+1} of {total} • {len(completed)}/{total} checked • {guide['action']}")
+
+    def activate_pet_region_selector(self):
+        # Regions are measured in canvas coordinates, not a separately imported PNG.
+        if self.pet_template_path.text().strip():
+            self.statusBar().showMessage('Region selection uses the main canvas. Import the creature onto the canvas first, or clear the template path.',6500)
+            return
+        self.tool.setCurrentText('Pet Region Select')
+        self.statusBar().showMessage('Drag a box around the selected body part on the canvas; release to save.',6000)
 
     def save_pet_region(self):
         name=self.pet_region_part.currentText()
@@ -1007,6 +1203,13 @@ class MainWindow(QMainWindow):
     def advanced_animator_visibility_changed(self,visible):
         self.advanced_animator_button.setText('🎞 Hide Intermediate Studio' if visible else '🎞 Open Intermediate Studio')
     def activate_tool(self,tool):
+        # This also handles selecting Eyedropper directly from the dropdown.
+        if tool=='Eyedropper':
+            previous=getattr(self,'_last_selected_tool','Pencil')
+            if previous!='Eyedropper':
+                self.eyedropper_previous_tool=previous
+        else:
+            self._last_selected_tool=tool
         self._restore_active_tool_size(tool)
         # Changing tools must visibly activate the canvas mode; it should not
         # silently deselect the art and leave the user wondering what happened.
