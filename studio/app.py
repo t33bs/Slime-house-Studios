@@ -1,5 +1,5 @@
 """Slime House Studios native Qt editor."""
-import base64, io, json, sys, csv
+import base64, io, json, sys, csv, traceback, faulthandler, logging
 from pathlib import Path
 from PIL import Image
 from PySide6.QtCore import Qt, QRect, QTimer, QSettings
@@ -294,13 +294,16 @@ class Canvas(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__();self.setWindowTitle('Slime House Studios — Pixel Art & Animation');self.setWindowIcon(QIcon(str(resource_path('assets/slime_mascot.png'))));self.resize(1450,860)
+        self._last_window_state='normal'
         self.settings=QSettings('Slime House Studios','Studio');self.pet_anchors={};self.frame_tracks={'Ink':{}};self.motion_keys={};self.layer_motion_keys={};self.pose_transition=None;self.frame_clips={};self.worksheet=NFTWorksheet();self.worksheet_row=None;self.size_px=(64,64);self.layers=[];self.regions=[];self.traits={};self.preview=[];self.index=0;self.frame_edits={};self.timeline_mode=False;self.paint_color=(169,229,188,255)
         self.history=UndoHistory();self._restoring=False;self._dirty=False;self.project_path=None
         self.recovery_path=Path.home()/'.slime_house_studios'/'recovery.json'
         self.autosave_timer=QTimer(self);self.autosave_timer.setInterval(60000);self.autosave_timer.timeout.connect(self.write_recovery);self.autosave_timer.start()
         self.timer=QTimer(self);self.timer.timeout.connect(self.next_frame)
         root=QWidget();self.setCentralWidget(root);layout=QHBoxLayout(root)
-        self.setDockOptions(QMainWindow.DockOption.AllowTabbedDocks | QMainWindow.DockOption.AnimatedDocks)
+        # Avoid Qt animated dock relayout during maximize/restore on Windows.
+        self.setDockOptions(QMainWindow.DockOption.AllowTabbedDocks)
+        self.setAnimated(False)
         self.setup_classic_menus()
         left=QWidget();lv=QVBoxLayout(left);left.setMaximumWidth(285);layout.addWidget(left)
         studio_title=QLabel('💚  SLIME HOUSE STUDIOS');studio_title.setObjectName('studioTitle');lv.addWidget(studio_title)
@@ -1826,6 +1829,15 @@ class MainWindow(QMainWindow):
             self.recovery_path.unlink(missing_ok=True)
         except Exception as exc:QMessageBox.warning(self,'Load failed',str(exc))
 
+    def changeEvent(self,event):
+        """Keep maximize/restore handling light; log state for Windows diagnostics."""
+        super().changeEvent(event)
+        if event.type() == event.Type.WindowStateChange:
+            state = ('maximized' if self.isMaximized() else
+                     'minimized' if self.isMinimized() else 'normal')
+            self._last_window_state = state
+            logging.getLogger('slimehouse').info('Main window state: %s', state)
+
     def closeEvent(self,event):
         if self._dirty:
             self.write_recovery()
@@ -1837,4 +1849,23 @@ class MainWindow(QMainWindow):
         event.accept()
 
 def main():
-    app=QApplication(sys.argv);app.setApplicationName('Slime House Studios');app.setWindowIcon(QIcon(str(resource_path('assets/slime_mascot.png'))));win=MainWindow();win.show();sys.exit(app.exec())
+    # Persistent diagnostics survive a frozen Windows EXE closing unexpectedly.
+    logdir = Path.home() / '.slime_house_studios'
+    logdir.mkdir(parents=True, exist_ok=True)
+    logfile = logdir / 'crash.log'
+    logging.basicConfig(filename=str(logfile), level=logging.INFO,
+                        format='%(asctime)s %(levelname)s %(message)s')
+    faultlog = open(logfile, 'a', encoding='utf-8', buffering=1)
+    faulthandler.enable(file=faultlog, all_threads=True)
+    def exception_hook(exc_type, exc, tb):
+        logging.getLogger('slimehouse').critical('Uncaught exception',
+                                                 exc_info=(exc_type, exc, tb))
+        traceback.print_exception(exc_type, exc, tb, file=faultlog)
+        faultlog.flush()
+    sys.excepthook = exception_hook
+    app=QApplication(sys.argv)
+    app.setApplicationName('Slime House Studios')
+    app.setWindowIcon(QIcon(str(resource_path('assets/slime_mascot.png'))))
+    win=MainWindow()
+    win.show()
+    sys.exit(app.exec())
