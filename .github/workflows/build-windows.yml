@@ -57,3 +57,10 @@ jobs:
           name: SlimeHouseStudios-Windows-Phase1-Test
           path: dist/SlimeHouseStudios.exe
           if-no-files-found: error
+      - name: Upload Windows installer
+        if: ${{ hashFiles('dist/*Setup*.exe') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: SlimeHouseStudios-Installer-Windows
+          path: dist/*Setup*.exe
+          if-no-files-found: error
