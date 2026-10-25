@@ -2,7 +2,8 @@
 import base64, io, json, sys, csv, traceback, faulthandler, logging
 from pathlib import Path
 from PIL import Image
-from PySide6.QtCore import Qt, QRect, QTimer, QSettings
+from PySide6.QtCore import Qt, QRect, QTimer, QSettings, QSignalBlocker
+from shiboken6 import isValid
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QIcon, QKeySequence, QShortcut, QFont, QCursor, QPixmap, QAction
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QHBoxLayout,QVBoxLayout,QPushButton,QLabel,QListWidget,QListWidgetItem,QFileDialog,QMessageBox,QComboBox,QSpinBox,QDoubleSpinBox,QFormLayout,QInputDialog,QTabWidget,QColorDialog,QLineEdit,QCheckBox,QScrollArea,QSlider,QTableWidget,QTableWidgetItem,QHeaderView,QDockWidget,QSizePolicy,QGroupBox,QDialog,QDialogButtonBox)
 from .pet_sprite_wizard import ANIMATIONS, LIFE_ANIMATIONS, BATTLE_ANIMATIONS, POSE_TEMPLATES, generate as generate_pet_animations, export_package as export_pet_package, animation_guide, format_animation_guide, export_animation_guides, generate_rigged, validate_regions, RIG_PARTS
@@ -101,9 +102,9 @@ class Canvas(QWidget):
                 a,b=self.drag[1:3]
                 rect=(min(a[0],b[0]),min(a[1],b[1]),abs(a[0]-b[0])+1,abs(a[1]-b[1])+1)
                 p.setPen(QPen(QColor('#ffe4a0'),2));p.drawRect(self.rect_screen(rect))
-        if m.tool.currentText()=='Pose Anchor' or (hasattr(m,'show_pet_anchors') and m.show_pet_anchors.isChecked()):
+        if m.tool.currentText()=='Pose Anchor' or (isValid(getattr(m,'show_pet_anchors',None)) and m.show_pet_anchors.isChecked()):
             p.setRenderHint(QPainter.RenderHint.Antialiasing,False)
-            for name,xy in m.pet_anchors.get(m.pet_pose.currentText(),{}).items():
+            for name,xy in m.pet_anchors.get(m.pet_pose.currentText() if isValid(getattr(m,'pet_pose',None)) else 'Idle',{}).items():
                 cx=int(self.ox+(xy[0]+.5)*self.zoom);cy=int(self.oy+(xy[1]+.5)*self.zoom)
                 p.setPen(QPen(QColor('#15202b'),4));p.drawEllipse(cx-6,cy-6,12,12)
                 p.setPen(QPen(QColor('#ffdc8b'),2));p.drawEllipse(cx-6,cy-6,12,12)
@@ -796,9 +797,11 @@ class MainWindow(QMainWindow):
         # Remove the retired dock from Qt's main-window layout entirely.
         # This also prevents its hidden size hints from affecting maximize/restore.
         self.removeDockWidget(self.pet_workshop_dock)
-        self.pet_workshop_dock.setParent(None)
-        self.pet_workshop_dock.deleteLater()
-        self.pet_workshop_dock=None
+        # v46: retain the hidden dock as a QObject owner. Deleting it also
+        # deletes its child widgets, but canvas painting, undo/restore and
+        # recovery still reference those widgets. Keep it alive until those
+        # dependencies can be removed in the dedicated builder-removal release.
+        # Do not reparent or schedule deletion here.
         self.install_beginner_helpers()
         self.update_guided_mode(self.guided_toggle.isChecked())
         self.activate_tool(self.tool.currentText())
@@ -1146,11 +1149,14 @@ class MainWindow(QMainWindow):
         for spin,value in zip(self.pet_region_spins,self.pet_regions[name]):spin.setValue(value)
 
     def refresh_pet_regions(self):
-        self.pet_region_list.clear()
-        for name,rect in sorted(self.pet_regions.items()):
-            item=QListWidgetItem(f'{name}: {rect}')
-            item.setData(Qt.ItemDataRole.UserRole,name)
-            self.pet_region_list.addItem(item)
+        if not isValid(getattr(self,'pet_region_list',None)):
+            return
+        with QSignalBlocker(self.pet_region_list):
+            self.pet_region_list.clear()
+            for name,rect in sorted(self.pet_regions.items()):
+                item=QListWidgetItem(f'{name}: {rect}')
+                item.setData(Qt.ItemDataRole.UserRole,name)
+                self.pet_region_list.addItem(item)
 
     def generate_pet_sprite_package(self):
         try:
@@ -1207,12 +1213,16 @@ class MainWindow(QMainWindow):
             self.checkpoint();del self.pet_anchors[pose][name];self.refresh_pet_anchors()
 
     def refresh_pet_anchors(self,*args):
-        self.pet_anchor_list.clear()
-        for name,xy in sorted(self.pet_anchors.get(self.pet_pose.currentText(),{}).items()):
-            from PySide6.QtWidgets import QListWidgetItem
-            item=QListWidgetItem(f'{name}: ({xy[0]}, {xy[1]})')
-            item.setData(Qt.ItemDataRole.UserRole,name)
-            self.pet_anchor_list.addItem(item)
+        if not isValid(getattr(self,'pet_anchor_list',None)) or not isValid(getattr(self,'pet_pose',None)):
+            return
+        # Block selection callbacks while replacing items: Qt may otherwise
+        # emit signals referencing an item that has just been destroyed.
+        with QSignalBlocker(self.pet_anchor_list):
+            self.pet_anchor_list.clear()
+            for name,xy in sorted(self.pet_anchors.get(self.pet_pose.currentText(),{}).items()):
+                item=QListWidgetItem(f'{name}: ({xy[0]}, {xy[1]})')
+                item.setData(Qt.ItemDataRole.UserRole,name)
+                self.pet_anchor_list.addItem(item)
 
     def select_pet_anchor(self,item):
         name=item.data(Qt.ItemDataRole.UserRole)
@@ -1873,8 +1883,14 @@ class MainWindow(QMainWindow):
                      'minimized' if self.isMinimized() else 'normal')
             self._last_window_state = state
             # Defer canvas redraw until Qt completes native window-state transitions.
-            QTimer.singleShot(0,self.canvas.update) if hasattr(self,'canvas') else None
+            # A queued callback must re-check widget lifetime when it runs.
+            QTimer.singleShot(0, self._update_canvas_if_alive)
             logging.getLogger('slimehouse').info('Main window state: %s', state)
+
+    def _update_canvas_if_alive(self):
+        canvas = getattr(self, 'canvas', None)
+        if isValid(canvas):
+            canvas.update()
 
     def closeEvent(self,event):
         if self._dirty:
