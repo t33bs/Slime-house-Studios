@@ -24,9 +24,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest
-           - name: Run tests
-           run: python -m unittest discover -s tests -q
-      - name: Run pytest regression suite
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -q
         run: python -m pytest tests -q
       - name: Windows GUI stability smoke test
         run: python -m tests.windows_gui_smoke
