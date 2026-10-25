@@ -1,32 +1,47 @@
-"""Windows Qt smoke test. Run on the GitHub Actions Windows runner, before packaging.
 
-Exercises the real Qt event loop and detects errors thrown during repaint.
-"""
-import os
+"""Windows Qt smoke test with startup and event-loop diagnostics."""
+
 import sys
 import traceback
-from pathlib import Path
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
-from studio.app import MainWindow
 
 
 def main():
+    print("SMOKE: Starting Qt application", flush=True)
     app = QApplication.instance() or QApplication([])
     failures = []
+
     def catch_exception(kind, exc, tb):
-        failures.append(''.join(traceback.format_exception(kind, exc, tb)))
+        message = "".join(traceback.format_exception(kind, exc, tb))
+        failures.append(message)
+        print(message, file=sys.stderr, flush=True)
         app.quit()
+
     sys.excepthook = catch_exception
-    # Avoid prompting about unrelated user recovery data in CI.
+
+    print("SMOKE: Importing MainWindow", flush=True)
+    from studio.app import MainWindow
+
+    print("SMOKE: Creating MainWindow", flush=True)
     MainWindow.offer_recovery = lambda self: None
     win = MainWindow()
-    win.autosave_timer.stop()
+
+    if hasattr(win, "autosave_timer"):
+        win.autosave_timer.stop()
+
+    print("SMOKE: Showing window", flush=True)
     win.show()
+
     stages = []
+
     for _ in range(10):
-        stages.extend((lambda: win.showMaximized(), lambda: win.showNormal()))
+        stages.extend([
+            lambda: win.showMaximized(),
+            lambda: win.showNormal(),
+        ])
+
     stages += [
         lambda: win.resize(1200, 800),
         lambda: win.nft_manager_dock.show(),
@@ -38,26 +53,56 @@ def main():
         lambda: win.restore_snapshot(win.snapshot()),
         lambda: win.canvas.update(),
     ]
+
     def step(index=0):
         if failures or index >= len(stages):
             app.quit()
             return
+
         try:
+            print(
+                f"SMOKE: Running stage {index + 1}/{len(stages)}",
+                flush=True,
+            )
             stages[index]()
             app.processEvents()
         except Exception:
-            failures.append(traceback.format_exc())
+            message = traceback.format_exc()
+            failures.append(message)
+            print(message, file=sys.stderr, flush=True)
             app.quit()
             return
+
         QTimer.singleShot(70, lambda: step(index + 1))
+
+    def timeout():
+        failures.append("GUI smoke test timed out")
+        print("SMOKE: Timeout", file=sys.stderr, flush=True)
+        app.quit()
+
+    timeout_timer = QTimer()
+    timeout_timer.setSingleShot(True)
+    timeout_timer.timeout.connect(timeout)
+    timeout_timer.start(20000)
+
     QTimer.singleShot(150, step)
-    QTimer.singleShot(20000, lambda: (failures.append('GUI smoke test timed out'), app.quit()))
+
+    print("SMOKE: Entering Qt event loop", flush=True)
     app.exec()
+    timeout_timer.stop()
+
     if failures:
-        print('\n'.join(failures), file=sys.stderr)
+        print("\n".join(failures), file=sys.stderr, flush=True)
         return 1
-    print('Windows GUI smoke test passed: maximize/restore, dock lifecycle, snapshot, repaint')
+
+    print("Windows GUI smoke test passed", flush=True)
     return 0
 
-if __name__ == '__main__':
-    raise SystemExit(main())
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception:
+        traceback.print_exc()
+        raise
+
