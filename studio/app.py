@@ -853,7 +853,6 @@ class MainWindow(QMainWindow):
     def update_guided_mode(self,enabled):
         self.settings.setValue('guided_mode',bool(enabled))
         self.active_tool_banner.setVisible(enabled)
-        self.pet_help.setVisible(enabled)
         self.statusBar().showMessage('Guided Mode on — tool tips are visible' if enabled else 'Guided Mode off — compact workspace',3500)
 
     def set_brush_hex(self,hex_color):
