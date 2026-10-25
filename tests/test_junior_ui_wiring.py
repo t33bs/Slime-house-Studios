@@ -17,6 +17,6 @@ class JuniorWiringTests(unittest.TestCase):
     def test_installer_and_workflow_exist(self):
         iss=(ROOT/'installer.iss').read_text(encoding='utf-8')
         flow=(ROOT/'.github/workflows/build-windows.yml').read_text(encoding='utf-8')
-        self.assertIn('SlimeHouseStudios-Setup',iss)
+        self.assertIn('SlimeHouseStudios-v0.6-Setup',iss)
         self.assertIn('ISCC.exe',flow)
         self.assertIn('SlimeHouseStudios-Installer-Windows',flow)

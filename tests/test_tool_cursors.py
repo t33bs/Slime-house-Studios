@@ -7,6 +7,6 @@ class CursorWiringTests(unittest.TestCase):
             self.assertIn("'"+name+"':",APP)
     def test_tool_switch_updates_cursor(self):
         self.assertIn('self.canvas.setCursor(cursor_for_tool(tool))',APP)
-        self.assertIn('return QCursor(pix,3,3)',APP)
+        self.assertIn('return QCursor(pix,5,5)',APP)
     def test_transform_uses_hand(self):
         self.assertIn('Qt.CursorShape.OpenHandCursor',APP)

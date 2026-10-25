@@ -21,6 +21,7 @@ class Region:
     effect: str = 'Float'
     strength: int = 2
     color: tuple = (160, 255, 190, 255)
+    blink_use_color: bool = False
     enabled: bool = True
     direction: str = "Right"
     beam_length: int = 18
@@ -133,12 +134,13 @@ def apply_region(frame,region,i,count):
                 ImageDraw.Draw(frame).rectangle((x,y,x+w-1,y+h-1),fill=(0,0,0,0))
             else:
                 frame.paste((0,0,0,0),(x,y,x+w,y+h),mask_crop)
-            # Retain the original eye color as a thin closed eyelid.
+            # Use the region's chosen color for the closed eyelid.
+            # Only draw where the selected eye pixels originally existed.
             cy=y+h//2
             for xx in range(w):
                 pixels=[crop.getpixel((xx,yy)) for yy in range(h) if crop.getpixel((xx,yy))[3]>0]
                 if pixels and 0<=x+xx<frame.width and 0<=cy<frame.height:
-                    frame.alpha_composite(Image.new('RGBA',(1,1),pixels[len(pixels)//2]),(x+xx,cy))
+                    frame.alpha_composite(Image.new('RGBA',(1,1),tuple(region.color) if region.blink_use_color else pixels[len(pixels)//2]),(x+xx,cy))
     elif effect=='Squash':
         hh=max(1,round(h*(1-.2*(1+math.sin(phase))/2)))
         if mask_crop is None:ImageDraw.Draw(frame).rectangle((x,y,x+w-1,y+h-1),fill=(0,0,0,0))

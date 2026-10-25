@@ -1,5 +1,5 @@
 #define AppName "Slime House Studios"
-#define AppVersion "1.0.0-preview"
+#define AppVersion "0.6.0"
 [Setup]
 AppId={{D95E4F18-6E5A-4DA6-9123-2C8A99D7A101}
 AppName={#AppName}
@@ -8,7 +8,7 @@ AppPublisher=Slime House Studios
 DefaultDirName={autopf}\Slime House Studios
 DefaultGroupName=Slime House Studios
 OutputDir=installer-output
-OutputBaseFilename=SlimeHouseStudios-Setup
+OutputBaseFilename=SlimeHouseStudios-v0.6-Setup
 Compression=lzma2
 SolidCompression=yes
 SetupIconFile=assets\slime_house_studios.ico

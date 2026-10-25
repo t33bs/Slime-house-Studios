@@ -2,14 +2,16 @@
 import base64, io, json, sys, csv, traceback, faulthandler, logging
 from pathlib import Path
 from PIL import Image
-from PySide6.QtCore import Qt, QRect, QTimer, QSettings, QSignalBlocker
+from PySide6.QtCore import Qt, QRect, QTimer, QSettings, QSignalBlocker, QThread, Signal
 from shiboken6 import isValid
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QIcon, QKeySequence, QShortcut, QFont, QCursor, QPixmap, QAction
-from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QHBoxLayout,QVBoxLayout,QPushButton,QLabel,QListWidget,QListWidgetItem,QFileDialog,QMessageBox,QComboBox,QSpinBox,QDoubleSpinBox,QFormLayout,QInputDialog,QTabWidget,QColorDialog,QLineEdit,QCheckBox,QScrollArea,QSlider,QTableWidget,QTableWidgetItem,QHeaderView,QDockWidget,QSizePolicy,QGroupBox,QDialog,QDialogButtonBox)
+from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QHBoxLayout,QVBoxLayout,QPushButton,QLabel,QListWidget,QListWidgetItem,QFileDialog,QMessageBox,QComboBox,QSpinBox,QDoubleSpinBox,QFormLayout,QInputDialog,QTabWidget,QColorDialog,QLineEdit,QCheckBox,QScrollArea,QSlider,QTableWidget,QTableWidgetItem,QHeaderView,QDockWidget,QSizePolicy,QGroupBox,QDialog,QDialogButtonBox,QAbstractItemView,QTextEdit,QPlainTextEdit)
 from .pet_sprite_wizard import ANIMATIONS, LIFE_ANIMATIONS, BATTLE_ANIMATIONS, POSE_TEMPLATES, generate as generate_pet_animations, export_package as export_pet_package, animation_guide, format_animation_guide, export_animation_guides, generate_rigged, validate_regions, RIG_PARTS
 from .history import UndoHistory, capture, decode, atomic_write
 from .worksheet import NFTWorksheet
 from .bucket_fill import flood_fill
+from .safe_export import safe_export
+from .coordinates import screen_to_pixel
 from .core import Layer,Region,EFFECTS,composite,transformed,paint_pixel,frames_for,compose_timeline_frames,apply_motion_keyframes,paste_clip,compose_layer_motion_frames,interpolate_pose_anchors,export_apng,export_gif,export_sprite_sheet,generate_traits
 
 def resource_path(p):return Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent.parent))/p
@@ -18,15 +20,15 @@ def qimage(im):
     im=im.convert('RGBA');return QImage(im.tobytes(),im.width,im.height,QImage.Format.Format_RGBA8888).copy()
 
 # Tiny high-contrast tool cursors, drawn locally so the EXE needs no extra assets.
-# The small crosshair is the exact canvas interaction point (hotspot 3,3).
+# The small crosshair is the exact canvas interaction point (hotspot 5,5).
 CURSOR_SYMBOLS={
     'Paint Bucket':'▨','Pencil':'✎','Eraser':'⌫','Mask Brush':'✦','Mask Eraser':'◇',
-    'Frame Pencil':'✎','Frame Eraser':'⌫','Pet Region Select':'▭','Eyedropper':'◉','Animation Region':'▭','Pose Anchor':'⌖',
+    'Frame Pencil':'✎','Frame Eraser':'⌫','Eyedropper':'◉','Animation Region':'▭',
 }
 CURSOR_COLORS={
     'Paint Bucket':'#a8f5d0','Pencil':'#ffe3a1','Eraser':'#ffb6b6','Mask Brush':'#91e6bb',
     'Mask Eraser':'#a7d3ff','Frame Pencil':'#f5cf9c',
-    'Frame Eraser':'#ffb9bd','Pet Region Select':'#7de4b3','Eyedropper':'#c4b5fd','Animation Region':'#d5bbef','Pose Anchor':'#ffdc8b',
+    'Frame Eraser':'#ffb9bd','Eyedropper':'#c4b5fd','Animation Region':'#d5bbef',
 }
 
 def cursor_for_tool(tool):
@@ -41,9 +43,9 @@ def cursor_for_tool(tool):
     color=QColor(CURSOR_COLORS[tool])
     # White/black crosshair remains readable on light or dark sprites.
     painter.setPen(QPen(QColor('#10151b'),3))
-    painter.drawLine(3,0,3,7);painter.drawLine(0,3,7,3)
+    painter.drawLine(5,2,5,9);painter.drawLine(2,5,9,5)
     painter.setPen(QPen(color,1))
-    painter.drawLine(3,0,3,7);painter.drawLine(0,3,7,3)
+    painter.drawLine(5,2,5,9);painter.drawLine(2,5,9,5)
     painter.setBrush(QColor('#19232c'))
     painter.setPen(QPen(color,2))
     painter.drawRoundedRect(10,9,24,24,5,5)
@@ -51,12 +53,22 @@ def cursor_for_tool(tool):
     painter.setPen(QPen(color,1))
     painter.drawText(QRect(11,10,22,22),Qt.AlignmentFlag.AlignCenter,CURSOR_SYMBOLS[tool])
     painter.end()
-    return QCursor(pix,3,3)
+    return QCursor(pix,5,5)
+
+class UpdateCheckWorker(QThread):
+    completed = Signal(object, str)
+    def run(self):
+        from .release_config import APP_VERSION, UPDATE_MANIFEST_URL, UPDATE_PUBLIC_KEY_B64
+        from .update_manager import check_update
+        try:
+            self.completed.emit(check_update(APP_VERSION, UPDATE_MANIFEST_URL, UPDATE_PUBLIC_KEY_B64), '')
+        except Exception as exc:
+            self.completed.emit(None, str(exc))
 
 class Canvas(QWidget):
     def __init__(self,main):
         super().__init__();self.main=main;self.setMinimumSize(260,260);self.drag=None;self.setMouseTracking(True);self.zoom_factor=1.0;self.zoom_focus=None
-    def coord(self,pos):return round((pos.x()-self.ox)/self.zoom),round((pos.y()-self.oy)/self.zoom)
+    def coord(self,pos):return screen_to_pixel(pos.x(),pos.y(),self.ox,self.oy,self.zoom)
     def rect_screen(self,rect):
         x,y,w,h=rect;return QRect(round(self.ox+x*self.zoom),round(self.oy+y*self.zoom),max(1,round(w*self.zoom)),max(1,round(h*self.zoom)))
     def paintEvent(self,event):
@@ -83,33 +95,20 @@ class Canvas(QWidget):
             img=transformed(l);r=self.rect_screen((l.x,l.y,img.width,img.height));p.setPen(QPen(QColor('#b9e4c9'),2));p.drawRect(r)
             for pt in (r.topLeft(),r.topRight(),r.bottomLeft(),r.bottomRight()):p.fillRect(QRect(pt.x()-4,pt.y()-4,9,9),QColor('#d1f0db'))
             p.setPen(QPen(QColor('#edc7a2'),2));p.drawEllipse(r.center().x()-5,r.top()-22,10,10)
-        if m.tool.currentText() in ('Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser'):
+        if m.tool.currentText() in ('Animation Region','Move Laser Asset','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser'):
             for i,reg in enumerate(m.regions):
                 p.setPen(QPen(QColor('#d5bbef' if i==m.region_list.currentRow() else '#8b799c'),2));p.drawRect(self.rect_screen(reg.rect))
             if 0<=m.region_list.currentRow()<len(m.regions):
                 reg=m.regions[m.region_list.currentRow()]
-                p.setPen(QPen(QColor('#91e6bb'),1))
-                for px,py in reg.mask:p.fillRect(self.rect_screen((px,py,1,1)),QColor(125,232,181,135))
+                # Use the selected effect's color for the editable highlight overlay.
+                # Keep the overlay translucent so underlying artwork stays visible.
+                rgba=reg.color
+                overlay=QColor(int(rgba[0]),int(rgba[1]),int(rgba[2]),max(35,min(175,int(rgba[3]*0.53))))
+                outline=QColor(int(rgba[0]),int(rgba[1]),int(rgba[2]),max(110,int(rgba[3])))
+                p.setPen(QPen(outline,1))
+                for px,py in reg.mask:p.fillRect(self.rect_screen((px,py,1,1)),overlay)
             if self.drag and self.drag[0]=='region':
                 a=self.drag[1];b=self.drag[2];p.setPen(QPen(QColor('#f3d3fc'),2));p.drawRect(self.rect_screen((min(a[0],b[0]),min(a[1],b[1]),abs(a[0]-b[0])+1,abs(a[1]-b[1])+1)))
-        # Show editable pet body-part boxes without adding another crowded panel.
-        if hasattr(m,'pet_regions') and (m.tool.currentText()=='Pet Region Select' or getattr(m,'pet_region_overlay_enabled',False)):
-            for name,rect in m.pet_regions.items():
-                p.setPen(QPen(QColor('#7de4b3'),2))
-                screen=self.rect_screen(rect);p.drawRect(screen)
-                p.drawText(screen.left()+3,max(12,screen.top()-4),name)
-            if self.drag and self.drag[0]=='pet-region':
-                a,b=self.drag[1:3]
-                rect=(min(a[0],b[0]),min(a[1],b[1]),abs(a[0]-b[0])+1,abs(a[1]-b[1])+1)
-                p.setPen(QPen(QColor('#ffe4a0'),2));p.drawRect(self.rect_screen(rect))
-        if m.tool.currentText()=='Pose Anchor' or (isValid(getattr(m,'show_pet_anchors',None)) and m.show_pet_anchors.isChecked()):
-            p.setRenderHint(QPainter.RenderHint.Antialiasing,False)
-            for name,xy in m.pet_anchors.get(m.pet_pose.currentText() if isValid(getattr(m,'pet_pose',None)) else 'Idle',{}).items():
-                cx=int(self.ox+(xy[0]+.5)*self.zoom);cy=int(self.oy+(xy[1]+.5)*self.zoom)
-                p.setPen(QPen(QColor('#15202b'),4));p.drawEllipse(cx-6,cy-6,12,12)
-                p.setPen(QPen(QColor('#ffdc8b'),2));p.drawEllipse(cx-6,cy-6,12,12)
-                p.drawLine(cx-9,cy,cx+9,cy);p.drawLine(cx,cy-9,cx,cy+9)
-                p.setPen(QColor('#fff2c7'));p.drawText(cx+11,cy-9,name)
 
     def wheelEvent(self,e):
         # Wheel zooms about the mouse pointer, keeping the pixel under it stationary.
@@ -139,7 +138,7 @@ class Canvas(QWidget):
         # It does not change the selected tool, color, or brush size.
         if e.button()==Qt.MouseButton.RightButton:
             context=m._drawing_context()
-            if tool in ('Eyedropper','Move / Transform','Pose Anchor','Animation Region'):
+            if tool in ('Eyedropper','Move / Transform','Animation Region'):
                 context=getattr(m,'last_drawing_context','base')
             if not (0<=x<m.size_px[0] and 0<=y<m.size_px[1]):return
             if context=='base' and l is None:return
@@ -147,6 +146,15 @@ class Canvas(QWidget):
             m.checkpoint();self.drag=['right-erase',context]
             self.erase_at(x,y,context)
             e.accept();return
+        if tool=='Move Laser Asset':
+            idx=m.region_list.currentRow()
+            if 0<=idx<len(m.regions) and m.regions[idx].effect=='Laser Eyes':
+                m.checkpoint()
+                self.drag=['laser-asset',x,y,tuple(m.regions[idx].rect),idx]
+                e.accept()
+            else:
+                m.statusBar().showMessage('Select a Laser Eyes asset first.',3000)
+            return
         if tool=='Paint Bucket':
             if not (0<=x<m.size_px[0] and 0<=y<m.size_px[1]):return
             if l is None:
@@ -157,16 +165,8 @@ class Canvas(QWidget):
             if filled is not None:
                 m.checkpoint();l.image=filled;m.invalidate()
             return
-        if tool=='Pet Region Select':
-            if m.pet_template_path.text().strip():
-                m.statusBar().showMessage('Clear the separate template path to select regions on the canvas.',4000);return
-            if 0<=x<m.size_px[0] and 0<=y<m.size_px[1]:
-                self.drag=['pet-region',(x,y),(x,y)];self.update()
-            return
         if tool=='Eyedropper':
             self.sample_color_at(x,y);return
-        if tool=='Pose Anchor':
-            m.checkpoint();self.drag=['anchor'];self.place_anchor(x,y);return
         if tool in ('Frame Pencil','Frame Eraser'):
             m.checkpoint();self.drag=['framepaint'];self.frame_paint_at(x,y);return
         if tool=='Animation Region':m.checkpoint();self.drag=['region',(x,y),(x,y)];return
@@ -222,13 +222,6 @@ class Canvas(QWidget):
         m.tool.setCurrentText(previous)
         self.update()
 
-    def place_anchor(self,x,y):
-        m=self.main
-        if not (0<=x<m.size_px[0] and 0<=y<m.size_px[1]):return
-        m.pet_anchor_x.setValue(x);m.pet_anchor_y.setValue(y)
-        pose=m.pet_pose.currentText();name=m.pet_anchor_name.currentText().strip() or 'Accessory'
-        m.pet_anchors.setdefault(pose,{})[name]=[x,y]
-        m.refresh_pet_anchors();self.update()
 
     def frame_paint_at(self,x,y,erase=False):
         m=self.main
@@ -277,8 +270,16 @@ class Canvas(QWidget):
         if mode=='right-erase':
             if e.buttons() & Qt.MouseButton.RightButton:self.erase_at(x,y,self.drag[1])
             return
-        if mode in ('region','pet-region'):self.drag[2]=(x,y);self.update();return
-        if mode=='anchor':self.place_anchor(x,y);return
+        if mode=='region':self.drag[2]=(x,y);self.update();return
+        if mode=='laser-asset':
+            _,sx,sy,original,idx=self.drag
+            if 0<=idx<len(m.regions):
+                ox,oy,w,h=original
+                nx=max(0,min(m.size_px[0]-1,ox+x-sx))
+                ny=max(0,min(m.size_px[1]-1,oy+y-sy))
+                m.regions[idx].rect=(nx,ny,w,h)
+                m.invalidate()
+            return
         if mode=='paint':self.paint_at(x,y);return
         if mode=='framepaint':self.frame_paint_at(x,y);return
         if mode=='mask':self.mask_at(x,y);return
@@ -290,14 +291,6 @@ class Canvas(QWidget):
         elif mode=='rotate':l.angle=(angle+(x-sx)*5)%360
         m.update_layer_controls();m.invalidate()
     def mouseReleaseEvent(self,e):
-        if self.drag and self.drag[0]=='pet-region':
-            a,b=self.drag[1:3];m=self.main
-            w,h=m.size_px
-            ax=max(0,min(w-1,a[0]));ay=max(0,min(h-1,a[1]))
-            bx=max(0,min(w-1,b[0]));by=max(0,min(h-1,b[1]))
-            rect=[min(ax,bx),min(ay,by),abs(ax-bx)+1,abs(ay-by)+1]
-            for spin,value in zip(m.pet_region_spins,rect):spin.setValue(value)
-            m.save_pet_region()
         if self.drag and self.drag[0]=='region':
             a,b=self.drag[1:];x,y=min(a[0],b[0]),min(a[1],b[1]);w,h=abs(a[0]-b[0])+1,abs(a[1]-b[1])+1
             self.main.add_region((x,y,w,h))
@@ -307,7 +300,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__();self.setWindowTitle('Slime House Studios — Pixel Art & Animation');self.setWindowIcon(QIcon(str(resource_path('assets/slime_mascot.png'))));self.resize(1450,860)
         self._last_window_state='normal'
-        self.settings=QSettings('Slime House Studios','Studio');self.pet_anchors={};self.frame_tracks={'Ink':{}};self.motion_keys={};self.layer_motion_keys={};self.pose_transition=None;self.frame_clips={};self.worksheet=NFTWorksheet();self.worksheet_row=None;self.size_px=(64,64);self.layers=[];self.regions=[];self.traits={};self.preview=[];self.index=0;self.frame_edits={};self.timeline_mode=False;self.paint_color=(169,229,188,255)
+        self.settings=QSettings('Slime House Studios','Studio');self.pet_anchors={};self.pet_regions={};self.frame_tracks={'Ink':{}};self.motion_keys={};self.layer_motion_keys={};self.pose_transition=None;self.frame_clips={};self.worksheet=NFTWorksheet();self.worksheet_row=None;self.size_px=(64,64);self.layers=[];self.regions=[];self.traits={};self.preview=[];self.index=0;self.frame_edits={};self.timeline_mode=False;self.paint_color=(169,229,188,255)
         self.history=UndoHistory();self._restoring=False;self._dirty=False;self.project_path=None
         self.recovery_path=Path.home()/'.slime_house_studios'/'recovery.json'
         self.autosave_timer=QTimer(self);self.autosave_timer.setInterval(60000);self.autosave_timer.timeout.connect(self.write_recovery);self.autosave_timer.start()
@@ -322,33 +315,27 @@ class MainWindow(QMainWindow):
         studio_title=QLabel('💚  SLIME HOUSE STUDIOS');studio_title.setObjectName('studioTitle');lv.addWidget(studio_title)
         studio_subtitle=QLabel('Draw little things. Make them move.');studio_subtitle.setObjectName('studioSubtitle');lv.addWidget(studio_subtitle)
         self.sizes=QComboBox();self.sizes.addItems(['32 × 32','64 × 64','128 × 128','256 × 256','512 × 512','Custom…']);self.sizes.setCurrentIndex(1);self.sizes.currentIndexChanged.connect(self.change_size);lv.addWidget(self.sizes)
+        # Keep essential canvas/file actions visible without requiring users to
+        # discover the File menu or animation export panel.
+        project_actions=QHBoxLayout();lv.addLayout(project_actions)
+        new_button=QPushButton('New Project');new_button.setToolTip('Start a fresh project (Ctrl+N)')
+        new_button.clicked.connect(self.new_project);project_actions.addWidget(new_button)
+        clear_button=QPushButton('Clear Canvas');clear_button.setToolTip('Remove artwork and animation regions; Ctrl+Z restores them')
+        clear_button.clicked.connect(self.clear_canvas);project_actions.addWidget(clear_button)
+        save_actions=QHBoxLayout();lv.addLayout(save_actions)
+        png_button=QPushButton('Save PNG');png_button.setToolTip('Export a still image of the canvas as PNG')
+        png_button.clicked.connect(self.export_canvas_png);save_actions.addWidget(png_button)
+        project_button=QPushButton('Save Project');project_button.setToolTip('Save editable layers and animation settings as JSON')
+        project_button.clicked.connect(self.save_project);save_actions.addWidget(project_button)
         b=QPushButton('Import PNG layer');b.clicked.connect(self.import_png);lv.addWidget(b)
         b=QPushButton('New blank paint layer');b.clicked.connect(self.new_layer);lv.addWidget(b)
         self.layer_list=QListWidget();self.layer_list.currentRowChanged.connect(self.update_layer_controls);self.layer_list.currentRowChanged.connect(self.refresh_layer_motion);lv.addWidget(self.layer_list)
         bar=QHBoxLayout();lv.addLayout(bar)
         for text,fn in [('↑',lambda:self.move_layer(1)),('↓',lambda:self.move_layer(-1)),('Delete',self.remove_layer)]:
             b=QPushButton(text);b.clicked.connect(fn);bar.addWidget(b)
-        lv.addWidget(QLabel('YOUR ACTIVE TOOL'))
-        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Pencil','Paint Bucket','Eraser','Eyedropper','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser','Pose Anchor','Pet Region Select']);lv.addWidget(self.tool)
-        self.active_tool_banner=QLabel('↔  Move / Transform  ·  Drag artwork to move it')
-        self.active_tool_banner.setObjectName('activeToolBanner')
-        self.active_tool_banner.setWordWrap(True)
-        lv.addWidget(self.active_tool_banner)
-        self.animator_button=QPushButton('✨ Open Junior Animator');self.animator_button.setToolTip('Quick effects for funny moving sprites and NFTs');lv.addWidget(self.animator_button)
-        self.advanced_animator_button=QPushButton('🎞 Open Intermediate Studio');self.advanced_animator_button.setToolTip('Frame-by-frame timeline for longer animations and GIFs');lv.addWidget(self.advanced_animator_button)
-        # Legacy Desktop Pet Builder is retired from the Studio interface.
-        self.pet_workshop_button=QPushButton('Legacy Desktop Pet Builder (retired)')
-        self.pet_workshop_button.hide()
-        self.guided_toggle=QCheckBox('💡 Guided Mode — show beginner tips')
-        self.guided_toggle.setChecked(self.settings.value('guided_mode',True,type=bool))
-        self.guided_toggle.toggled.connect(self.update_guided_mode)
-        lv.addWidget(self.guided_toggle)
-        self.nft_manager_button=QPushButton('🐱 Open NFT Manager')
-        self.nft_manager_button.setToolTip('Optional NFT worksheet and trait tools — hide this for a clean pixel-art workspace.')
-        lv.addWidget(self.nft_manager_button)
-        # Keep color choices above the workshop difficulty/guidance options.
+        # Primary color controls stay above tools and both animation studio buttons.
         color=QPushButton('Choose brush color');color.clicked.connect(self.choose_color)
-        lv.insertWidget(lv.indexOf(self.guided_toggle),color)
+        lv.addWidget(color)
         palette=QWidget();palette_row=QHBoxLayout(palette);palette_row.setContentsMargins(0,0,0,0)
         for hex_color in ('#111827','#FFFFFF','#F4B5A5','#FFD166','#77F5A0','#52C7FF','#BB83FF','#FF76C8'):
             swatch=QPushButton('');swatch.setFixedSize(24,24)
@@ -356,7 +343,23 @@ class MainWindow(QMainWindow):
             swatch.setStyleSheet('background:'+hex_color+';border:1px solid #8ba6a0;border-radius:3px;')
             swatch.clicked.connect(lambda checked=False,c=hex_color:self.set_brush_hex(c))
             palette_row.addWidget(swatch)
-        lv.insertWidget(lv.indexOf(self.guided_toggle),palette)
+        lv.addWidget(palette)
+        lv.addWidget(QLabel('YOUR ACTIVE TOOL'))
+        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Pencil','Paint Bucket','Eraser','Eyedropper','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser']);lv.addWidget(self.tool)
+        self.active_tool_banner=QLabel('↔  Move / Transform  ·  Drag artwork to move it')
+        self.active_tool_banner.setObjectName('activeToolBanner')
+        self.active_tool_banner.setWordWrap(True)
+        lv.addWidget(self.active_tool_banner)
+        self.animator_button=QPushButton('✨ Open Junior Animator');self.animator_button.setToolTip('Quick effects for funny moving sprites and NFTs');lv.addWidget(self.animator_button)
+        self.advanced_animator_button=QPushButton('🎞 Open Intermediate Studio');self.advanced_animator_button.setToolTip('Frame-by-frame timeline for longer animations and GIFs');lv.addWidget(self.advanced_animator_button)
+        # Legacy Desktop Pet Builder is retired from the Studio interface.
+        self.guided_toggle=QCheckBox('💡 Guided Mode — show beginner tips')
+        self.guided_toggle.setChecked(self.settings.value('guided_mode',True,type=bool))
+        self.guided_toggle.toggled.connect(self.update_guided_mode)
+        lv.addWidget(self.guided_toggle)
+        self.nft_manager_button=QPushButton('🐱 Open NFT Manager')
+        self.nft_manager_button.setToolTip('Optional NFT worksheet and trait tools — hide this for a clean pixel-art workspace.')
+        lv.addWidget(self.nft_manager_button)
         self.brush=QSpinBox();self.brush.setRange(1,32);self.brush.setValue(1)
         self.x=QSpinBox();self.y=QSpinBox();self.scale=QDoubleSpinBox();self.angle=QDoubleSpinBox()
         for s in (self.x,self.y):s.setRange(-4096,4096)
@@ -398,6 +401,10 @@ class MainWindow(QMainWindow):
         self.highlight_erase_button.clicked.connect(lambda:self.tool.setCurrentText('Mask Eraser'))
         junior_actions.addWidget(self.highlight_erase_button)
         av.addLayout(junior_actions)
+        self.add_laser_asset_button=QPushButton('＋ Add movable Laser Eyes')
+        self.add_laser_asset_button.setToolTip('Creates an animated laser emitter you can drag to an eye with the Move Laser Asset tool.')
+        self.add_laser_asset_button.clicked.connect(self.add_laser_asset)
+        av.addWidget(self.add_laser_asset_button)
         self.junior_preview_button=QPushButton('▶ Preview my animation')
         self.junior_preview_button.setToolTip('Play the selected animation on the main canvas.')
         self.junior_preview_button.clicked.connect(self.start_preview)
@@ -545,211 +552,8 @@ class MainWindow(QMainWindow):
         self.advanced_layout.addWidget(QLabel('Choose Frame Pencil or Frame Eraser to paint on the selected frame.'))
         self.advanced_layout.addStretch()
         av.addStretch()
-        # Desktop Pet Builder: optional dock, using the existing sprite and animation engine.
-        self.pet_workshop_dock=QDockWidget('Desktop Pet & Creature Studio',self)
-        self.pet_workshop_dock.setObjectName('DesktopPetBuilderDock')
-        self.pet_workshop_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable | QDockWidget.DockWidgetFeature.DockWidgetMovable | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
-        self.pet_workshop_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
-        pet_scroll=QScrollArea();pet_scroll.setWidgetResizable(True)
-        pet_widget=QWidget();pet_layout=QVBoxLayout(pet_widget)
-        # Two-level workflow: an approachable guide first, existing tools retained in Advanced.
-        pet_tabs=QTabWidget()
-        guide_page=QWidget();guide_page_layout=QVBoxLayout(guide_page)
-        intro=QLabel('Start here: choose a creature, then follow one animation recipe at a time.')
-        intro.setWordWrap(True);guide_page_layout.addWidget(intro)
-        import_button=QPushButton('1. Import a creature PNG')
-        import_button.clicked.connect(self.choose_pet_template)
-        guide_page_layout.addWidget(import_button)
-        rig_builder=QPushButton('🧩 Open Creature Rig & Sprite Sheet Builder')
-        rig_builder.clicked.connect(self.open_creature_rig_builder)
-        guide_page_layout.addWidget(rig_builder)
-        use_canvas=QPushButton('Or use the current canvas')
-        use_canvas.clicked.connect(lambda:self.pet_template_path.clear())
-        guide_page_layout.addWidget(use_canvas)
-        guide_page_layout.addWidget(QLabel('2. Choose an animation'))
-        self.pet_guide_action=QComboBox();self.pet_guide_action.addItems(ANIMATIONS)
-        guide_page_layout.addWidget(self.pet_guide_action)
-        self.pet_guide_progress=QLabel('Step 1')
-        guide_page_layout.addWidget(self.pet_guide_progress)
-        self.pet_guide_title=QLabel();self.pet_guide_title.setWordWrap(True)
-        self.pet_guide_title.setStyleSheet('font-size:17px;font-weight:700;color:#c2f5d1')
-        guide_page_layout.addWidget(self.pet_guide_title)
-        self.pet_guide_instructions=QLabel();self.pet_guide_instructions.setWordWrap(True)
-        guide_page_layout.addWidget(self.pet_guide_instructions)
-        # Contextual action keeps the next useful editor tool one click away.
-        self.pet_guide_tool=QPushButton('Open suggested tool')
-        self.pet_guide_tool.clicked.connect(self.open_pet_guide_tool)
-        guide_page_layout.addWidget(self.pet_guide_tool)
-        self.pet_guide_done=QCheckBox('Mark this step complete')
-        self.pet_guide_done.toggled.connect(self.mark_pet_guide_step)
-        guide_page_layout.addWidget(self.pet_guide_done)
-        guide_nav=QHBoxLayout()
-        self.pet_guide_back=QPushButton('← Back');self.pet_guide_back.clicked.connect(lambda:self.move_pet_guide(-1))
-        self.pet_guide_next=QPushButton('Next step →');self.pet_guide_next.clicked.connect(lambda:self.move_pet_guide(1))
-        guide_nav.addWidget(self.pet_guide_back);guide_nav.addWidget(self.pet_guide_next)
-        guide_page_layout.addLayout(guide_nav)
-        self.pet_guide_show_advanced=QPushButton('Show detailed tools / export →')
-        self.pet_guide_show_advanced.clicked.connect(lambda:pet_tabs.setCurrentIndex(1))
-        guide_page_layout.addWidget(self.pet_guide_show_advanced)
-        guide_page_layout.addStretch()
-        self.pet_guide_step=0
-        self.pet_guide_action.currentTextChanged.connect(self.pet_guide_animation_changed)
-        pet_tabs.addTab(guide_page,'Create • Step by Step')
-        pet_tabs.addTab(pet_scroll,'Advanced / Export')
-        self.pet_workshop_dock.setWidget(pet_tabs)
-        self.pet_studio_tabs=pet_tabs
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,self.pet_workshop_dock)
-        self.pet_workshop_button.clicked.connect(self.toggle_pet_workshop)
-        self.pet_workshop_dock.visibilityChanged.connect(self.pet_workshop_visibility_changed)
-        wizard_group=QGroupBox('✨ Sprite Sheet Wizard — 3 easy steps')
-        wizard_layout=QVBoxLayout(wizard_group)
-        # Suggestions are independent of Guided Mode and never control the editing tools.
-        self.pet_suggestions_toggle=QCheckBox('Show animation suggestions / recipes')
-        self.pet_suggestions_toggle.setChecked(self.settings.value('pet_suggestions',True,type=bool))
-        self.pet_suggestions_toggle.toggled.connect(self.update_pet_suggestions)
-        wizard_layout.addWidget(self.pet_suggestions_toggle)
-        self.pet_auto_toggle=QCheckBox('Enable automatic preset generation')
-        self.pet_auto_toggle.setChecked(self.settings.value('pet_auto_generation',False,type=bool))
-        self.pet_auto_toggle.toggled.connect(self.update_pet_auto_generation)
-        wizard_layout.addWidget(self.pet_auto_toggle)
-        wizard_layout.addWidget(QLabel('1. Upload a transparent creature PNG (or use the current canvas).'))
-        self.pet_template_path=QLineEdit();self.pet_template_path.setPlaceholderText('Current canvas (default)')
-        wizard_layout.addWidget(self.pet_template_path)
-        pick_template=QPushButton('📁 Choose creature PNG')
-        pick_template.clicked.connect(self.choose_pet_template)
-        wizard_layout.addWidget(pick_template)
-        wizard_layout.addWidget(QLabel('Creature body type (helps tailor your drawing plan):'))
-        self.pet_body_type=QComboBox()
-        self.pet_body_type.addItems(['General / unknown','Two-legged','Four-legged','Flying / winged','Floating / limbless','Crawling'])
-        wizard_layout.addWidget(self.pet_body_type)
-        rig_group=QGroupBox('✂ Optional body-part regions — pixel coordinates')
-        rig_layout=QVBoxLayout(rig_group)
-        rig_layout.addWidget(QLabel('Mark a rectangular part of your PNG. Leave empty for whole-body animation.\nRegions must not overlap. All values are source-image pixels.'))
-        self.pet_regions={}
-        self.pet_region_part=QComboBox();self.pet_region_part.addItems(RIG_PARTS)
-        rig_layout.addWidget(self.pet_region_part)
-        region_form=QFormLayout()
-        self.pet_region_spins=[]
-        for caption in ('X','Y','Width','Height'):
-            spin=QSpinBox();spin.setRange(0 if caption in ('X','Y') else 1,1024)
-            if caption in ('Width','Height'):spin.setValue(8)
-            region_form.addRow(caption,spin);self.pet_region_spins.append(spin)
-        rig_layout.addLayout(region_form)
-        visual_region=QPushButton('Draw selected body part on canvas')
-        visual_region.setToolTip('Choose a body part above, then drag a rectangle on the main canvas. Its pixel coordinates save automatically.')
-        visual_region.clicked.connect(self.activate_pet_region_selector)
-        rig_layout.addWidget(visual_region)
-        add_region=QPushButton('Save marked part');add_region.clicked.connect(self.save_pet_region)
-        remove_region=QPushButton('Remove selected part');remove_region.clicked.connect(self.remove_pet_region)
-        rig_layout.addWidget(add_region);rig_layout.addWidget(remove_region)
-        self.pet_region_list=QListWidget();rig_layout.addWidget(self.pet_region_list)
-        self.pet_region_list.itemClicked.connect(self.select_pet_region)
-        wizard_layout.addWidget(rig_group)
-        wizard_layout.addWidget(QLabel('2. Select starter animations (you can refine them later).'))
-        self.pet_animation_checks={}
-        life_group=QGroupBox('🐾 Everyday life — select any (31 recipes)')
-        life_layout=QVBoxLayout(life_group)
-        for animation in LIFE_ANIMATIONS:
-            check=QCheckBox(animation)
-            check.setChecked(animation in ('Idle breathing','Sleeping','Eating','Pooping','Happy bounce','Walking','Hopping'))
-            self.pet_animation_checks[animation]=check
-            life_layout.addWidget(check)
-        wizard_layout.addWidget(life_group)
-        extra_group=QGroupBox('Other / battle presets (optional)')
-        extra_layout=QVBoxLayout(extra_group)
-        for animation in ('Idle', 'Blink', 'Walk', 'Hop', 'Eat', 'Sleep', 'Poop')+BATTLE_ANIMATIONS:
-            check=QCheckBox(animation)
-            self.pet_animation_checks[animation]=check
-            extra_layout.addWidget(check)
-        wizard_layout.addWidget(extra_group)
-        wizard_layout.addWidget(QLabel('Pose template parts (drawing guide, not required):'))
-        self.pet_pose_template_hint=QLabel()
-        self.pet_pose_template_hint.setWordWrap(True)
-        wizard_layout.addWidget(self.pet_pose_template_hint)
-        self.pet_body_type.currentTextChanged.connect(self.update_pet_pose_template_hint)
-        self.update_pet_pose_template_hint()
-        wizard_options=QFormLayout()
-        self.pet_wizard_frames=QSpinBox();self.pet_wizard_frames.setRange(2,24);self.pet_wizard_frames.setValue(8)
-        self.pet_wizard_fps=QSpinBox();self.pet_wizard_fps.setRange(1,30);self.pet_wizard_fps.setValue(8)
-        wizard_options.addRow('Frames per animation',self.pet_wizard_frames)
-        wizard_options.addRow('Playback FPS',self.pet_wizard_fps)
-        wizard_layout.addLayout(wizard_options)
-        guide_group=QGroupBox('📖 Animation Recipe — what should I draw?')
-        guide_layout=QVBoxLayout(guide_group)
-        self.pet_recipe_action=QComboBox();self.pet_recipe_action.addItems(ANIMATIONS)
-        guide_layout.addWidget(self.pet_recipe_action)
-        self.pet_recipe_text=QLabel();self.pet_recipe_text.setWordWrap(True)
-        self.pet_recipe_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        guide_layout.addWidget(self.pet_recipe_text)
-        for signal in (self.pet_recipe_action.currentTextChanged,self.pet_body_type.currentTextChanged):
-            signal.connect(self.update_pet_animation_recipe)
-        self.pet_wizard_frames.valueChanged.connect(self.update_pet_animation_recipe)
-        wizard_layout.addWidget(guide_group)
-        self.pet_recipe_group=guide_group
-        self.pet_recipe_group.setVisible(self.pet_suggestions_toggle.isChecked())
-        self.update_pet_animation_recipe()
-        self.refresh_pet_guide()
-
-        self.pet_export_frames=QCheckBox('Individual PNG frames');self.pet_export_frames.setChecked(True)
-        self.pet_export_gif=QCheckBox('GIF previews');self.pet_export_gif.setChecked(True)
-        self.pet_export_apng=QCheckBox('APNG previews (.png)');self.pet_export_apng.setChecked(True)
-        for check in (self.pet_export_frames,self.pet_export_gif,self.pet_export_apng):wizard_layout.addWidget(check)
-        wizard_layout.addWidget(QLabel('3. Generate a transparent sprite sheet + JSON.'))
-        wizard_button=QPushButton('✨ Generate Sprite Sheet Package')
-        wizard_button.clicked.connect(self.generate_pet_sprite_package)
-        self.pet_generate_button=wizard_button
-        self.pet_generate_button.setEnabled(self.pet_auto_toggle.isChecked())
-        manual_button=QPushButton('🎨 Export current artwork as manual sprite sheet (no presets)')
-        manual_button.clicked.connect(self.export_manual_pet_sprite)
-        wizard_layout.addWidget(manual_button)
-        wizard_layout.addWidget(wizard_button)
-        warning=QLabel('Flattened PNGs use whole-body motion presets. Blinking and articulated limbs require editable layers/eye masks; no new anatomy is invented.')
-        warning.setWordWrap(True);wizard_layout.addWidget(warning)
-        pet_layout.addWidget(wizard_group)
-        pet_layout.addWidget(QLabel('🐾 Set attachment anchors for reusable desktop-pet poses.'))
-        self.pet_help=QLabel('Choose a pose, enter an anchor name and X/Y pixel coordinates, then save it in your project. Use anchors to align accessories between different poses.')
-        self.pet_help.setWordWrap(True);pet_layout.addWidget(self.pet_help)
-        self.pet_pose=QComboBox();self.pet_pose.addItems(['Idle','Walk','Run','Jump','Sleep','Crawl','Sit','Attack','Custom'])
-        pet_layout.addWidget(QLabel('Pet pose'));pet_layout.addWidget(self.pet_pose)
-        pose_transition_box=QGroupBox('↝ Pose transition preview')
-        pose_transition_layout=QFormLayout(pose_transition_box)
-        self.pose_start=QComboBox();self.pose_end=QComboBox()
-        for selector in (self.pose_start,self.pose_end):selector.addItems(['Idle','Walk','Run','Jump','Sleep','Crawl','Sit','Attack','Custom'])
-        self.pose_end.setCurrentText('Walk')
-        pose_transition_layout.addRow('From pose',self.pose_start);pose_transition_layout.addRow('To pose',self.pose_end)
-        self.pose_transition_preview=QLabel('Choose two poses to preview how shared anchors move.')
-        self.pose_transition_preview.setWordWrap(True)
-        button=QPushButton('↝ Preview anchor transition')
-        button.clicked.connect(self.preview_pose_transition)
-        pose_transition_layout.addRow(button);pose_transition_layout.addRow(self.pose_transition_preview)
-        pet_layout.addWidget(pose_transition_box)
-        self.pet_anchor_name=QComboBox();self.pet_anchor_name.setEditable(True)
-        self.pet_anchor_name.addItems(['Head','Left Ear','Right Ear','Neck','Left Hand','Right Hand','Back','Feet','Tail','Accessory'])
-        pet_layout.addWidget(QLabel('Attachment anchor'));pet_layout.addWidget(self.pet_anchor_name)
-        self.pet_anchor_x=QSpinBox();self.pet_anchor_y=QSpinBox()
-        for spin in (self.pet_anchor_x,self.pet_anchor_y):spin.setRange(0,2048)
-        self.pet_anchor_x.setValue(32);self.pet_anchor_y.setValue(32)
-        pet_coords=QFormLayout();pet_coords.addRow('Anchor X (px)',self.pet_anchor_x);pet_coords.addRow('Anchor Y (px)',self.pet_anchor_y)
-        pet_layout.addLayout(pet_coords)
-        save_anchor=QPushButton('📌 Save pose anchor');save_anchor.clicked.connect(self.save_pet_anchor);pet_layout.addWidget(save_anchor)
-        remove_anchor=QPushButton('Remove selected anchor');remove_anchor.clicked.connect(self.remove_pet_anchor);pet_layout.addWidget(remove_anchor)
-        self.pet_anchor_list=QListWidget();pet_layout.addWidget(self.pet_anchor_list)
-        self.pet_anchor_list.itemClicked.connect(self.select_pet_anchor)
-        self.pet_pose.currentTextChanged.connect(self.refresh_pet_anchors)
-        self.show_pet_anchors=QCheckBox('Show pose anchors on canvas')
-        self.show_pet_anchors.setChecked(True);self.show_pet_anchors.toggled.connect(self.canvas.update)
-        pet_layout.addWidget(self.show_pet_anchors)
-        place_anchor_button=QPushButton('⌖ Place anchor on canvas')
-        place_anchor_button.clicked.connect(lambda:self.tool.setCurrentText('Pose Anchor'))
-        pet_layout.addWidget(place_anchor_button)
-        pet_layout.addWidget(QLabel('Anchors snap to whole sprite pixels and can be dragged with the Pose Anchor tool.'))
-        clear_anchor=QPushButton('⌫ Erase selected pose anchor')
-        clear_anchor.clicked.connect(self.remove_pet_anchor);pet_layout.addWidget(clear_anchor)
-        reset_mesh=QPushButton('↺ Reset selected layer transform (mesh)')
-        reset_mesh.setToolTip('Reset the selected layer to 100% scale and 0° rotation without deleting artwork.')
-        reset_mesh.clicked.connect(self.reset_layer_mesh);pet_layout.addWidget(reset_mesh)
-        pet_layout.addWidget(QLabel('Anchors are stored in editable project JSON and can be undone/redone.'))
-        pet_layout.addStretch()
+        # v0.6: retired Desktop Pet Builder dock and its child widgets removed.
+        # Creature animation authoring lives in the separate Friendly Animator.
         # NFT tools live in an optional, independent dock rather than occupying
         # the main editor's permanent sidebar. Closing the dock preserves state.
         self.nft_manager_dock=QDockWidget('NFT Manager — Optional Tools',self)
@@ -769,11 +573,13 @@ class MainWindow(QMainWindow):
         upload=QPushButton('Open worksheet (.xlsx / .csv)');upload.clicked.connect(self.open_worksheet);wv.addWidget(upload)
         self.worksheet_info=QLabel('No worksheet loaded');self.worksheet_info.setWordWrap(True);wv.addWidget(self.worksheet_info)
         self.worksheet_id_col=QComboBox();self.worksheet_id_col.currentTextChanged.connect(self.change_worksheet_id_column)
-        wv.addWidget(QLabel('Column containing NFT numbers'));wv.addWidget(self.worksheet_id_col)
+        worksheet_column_label=QLabel('Column containing NFT numbers')
+        worksheet_column_label.setContentsMargins(7,0,0,0)
+        wv.addWidget(worksheet_column_label);wv.addWidget(self.worksheet_id_col)
         lookup_row=QHBoxLayout();wv.addLayout(lookup_row)
         self.nft_number=QLineEdit();self.nft_number.setPlaceholderText('e.g. 0059');self.nft_number.returnPressed.connect(self.lookup_worksheet_nft);lookup_row.addWidget(self.nft_number)
         find_btn=QPushButton('Load NFT');find_btn.clicked.connect(self.lookup_worksheet_nft);lookup_row.addWidget(find_btn)
-        self.worksheet_table=QTableWidget(0,2);self.worksheet_table.setHorizontalHeaderLabels(['Worksheet column','Value (editable)']);self.worksheet_table.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeMode.Stretch);wv.addWidget(self.worksheet_table)
+        self.worksheet_table=QTableWidget(0,2);self.worksheet_table.setHorizontalHeaderLabels(['Worksheet column','Value (editable)']);self.worksheet_table.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeMode.Stretch);self.worksheet_table.horizontalHeader().setStyleSheet('QHeaderView::section { padding-left: 9px; padding-right: 5px; }');self.worksheet_table.setColumnWidth(0,180);wv.addWidget(self.worksheet_table)
         save_row=QHBoxLayout();wv.addLayout(save_row)
         save_edit=QPushButton('Save edits to session');save_edit.clicked.connect(self.save_worksheet_edits);save_row.addWidget(save_edit)
         export_btn=QPushButton('Export updated worksheet');export_btn.clicked.connect(self.export_worksheet);save_row.addWidget(export_btn)
@@ -793,15 +599,6 @@ class MainWindow(QMainWindow):
         self.animator_dock.hide()
         self.advanced_animator_dock.hide()
         self.nft_manager_dock.hide()
-        self.pet_workshop_dock.hide()
-        # Remove the retired dock from Qt's main-window layout entirely.
-        # This also prevents its hidden size hints from affecting maximize/restore.
-        self.removeDockWidget(self.pet_workshop_dock)
-        # v46: retain the hidden dock as a QObject owner. Deleting it also
-        # deletes its child widgets, but canvas painting, undo/restore and
-        # recovery still reference those widgets. Keep it alive until those
-        # dependencies can be removed in the dedicated builder-removal release.
-        # Do not reparent or schedule deletion here.
         self.install_beginner_helpers()
         self.update_guided_mode(self.guided_toggle.isChecked())
         self.activate_tool(self.tool.currentText())
@@ -857,8 +654,14 @@ class MainWindow(QMainWindow):
         self.tool.setToolTip('Choose how the mouse interacts with the canvas. B: brush/pencil, E: eraser, I: eyedropper. B/E use the active drawing context.')
         self.layer_list.setToolTip('Select the artwork layer you want to edit.')
         self.setStatusTip('Tip: Import a PNG or create a blank layer to begin.')
-        for keys,fn in [('Ctrl+Z',self.undo),('Ctrl+Shift+Z',self.redo),('Ctrl+Y',self.redo),('Ctrl+N',self.new_project),('I',self.activate_eyedropper),('B',self.activate_universal_brush),('E',self.activate_universal_eraser),('+',lambda:self.adjust_brush_size(1)),('=',lambda:self.adjust_brush_size(1)),('-',lambda:self.adjust_brush_size(-1)),('Ctrl+O',self.load_project),('Ctrl+S',self.save_project),('Ctrl+I',self.import_png),('Ctrl+E',self.export_choose_formats)]:
+        for keys,fn in [('Ctrl+Z',self.undo),('Ctrl+Shift+Z',self.redo),('Ctrl+Y',self.redo),('I',self.activate_eyedropper),('B',self.activate_universal_brush),('E',self.activate_universal_eraser),('+',lambda:self.adjust_brush_size(1)),('=',lambda:self.adjust_brush_size(1)),('-',lambda:self.adjust_brush_size(-1)),('Ctrl+O',self.load_project),('Ctrl+S',self.save_project),('Ctrl+I',self.import_png),('Ctrl+E',self.export_choose_formats)]:
             shortcut=QShortcut(QKeySequence(keys),self);shortcut.activated.connect(fn)
+        # Keep native Delete behavior in editors by disabling the shortcut BEFORE
+        # Qt's shortcut dispatch (returning from a callback would swallow the key).
+        self.delete_asset_shortcut=QShortcut(QKeySequence('Delete'),self)
+        self.delete_asset_shortcut.activated.connect(self.delete_selected_asset)
+        QApplication.instance().focusChanged.connect(self.update_delete_shortcut_focus)
+        self.update_delete_shortcut_focus(None,QApplication.focusWidget())
         self.statusBar().showMessage('Ready! Import a PNG or create a blank layer. Hover over a tool for help.',9000)
 
     def setup_classic_menus(self):
@@ -877,6 +680,8 @@ class MainWindow(QMainWindow):
         add(file_menu,'&New Project',self.new_project,'Ctrl+N')
         add(file_menu,'&Open Project…',self.load_project)
         add(file_menu,'&Save Project…',self.save_project)
+        add(file_menu,'Save Canvas as PNG…',self.export_canvas_png)
+        add(file_menu,'Clear Canvas…',self.clear_canvas)
         file_menu.addSeparator()
         add(file_menu,'Import PNG Layer…',self.import_png)
         add(file_menu,'Export Animation…',self.export_choose_formats)
@@ -885,6 +690,35 @@ class MainWindow(QMainWindow):
         add(view_menu,'Reset Canvas Zoom',lambda:self.canvas.reset_zoom() if hasattr(self,'canvas') else None,'Ctrl+0')
         add(view_menu,'Zoom In',lambda:self.adjust_canvas_zoom(1),'Ctrl++')
         add(view_menu,'Zoom Out',lambda:self.adjust_canvas_zoom(-1),'Ctrl+-')
+        help_menu=menu.addMenu('&Help')
+        add(help_menu,'Check for Updates…',self.check_for_updates)
+
+    def check_for_updates(self):
+        from .release_config import UPDATE_MANIFEST_URL, UPDATE_PUBLIC_KEY_B64
+        if not UPDATE_MANIFEST_URL or not UPDATE_PUBLIC_KEY_B64:
+            QMessageBox.information(self,'Updates not configured',
+                'Signed update checks will become available after the official update feed is published.\n'
+                'For now, visit the Slime House Studios GitHub Releases page.')
+            return
+        if getattr(self,'_update_worker',None) and self._update_worker.isRunning():
+            return
+        self._update_worker=UpdateCheckWorker(self)
+        self._update_worker.completed.connect(self._update_check_finished)
+        self._update_worker.start()
+        self.statusBar().showMessage('Checking for signed updates…')
+
+    def _update_check_finished(self,payload,error):
+        self.statusBar().showMessage('Update check finished.',5000)
+        if error:
+            QMessageBox.warning(self,'Update check failed',error)
+        elif not payload:
+            QMessageBox.information(self,'Up to date','You are using the latest available version.')
+        elif QMessageBox.question(self,'Update available',
+                f"Slime House Studios {payload['version']} is available.\n"
+                'Open the official GitHub release to download the installer?') == QMessageBox.StandardButton.Yes:
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl(payload['installer_url']))
 
     def adjust_canvas_zoom(self,direction):
         if not hasattr(self,'canvas'):return
@@ -959,6 +793,37 @@ class MainWindow(QMainWindow):
         self._tool_sizes[tool] = value
         self.statusBar().showMessage(f'{tool} size: {value} px', 1800)
 
+    def clear_canvas(self):
+        """Clear the current artwork without changing canvas dimensions. Undoable."""
+        if not self.layers and not self.regions and not self.frame_edits and not self.frame_clips:
+            self.statusBar().showMessage('Canvas is already empty',2500)
+            return
+        answer=QMessageBox.question(self,'Clear canvas?',
+            'Remove all artwork layers and animation regions from this canvas?\n\n'
+            'Your canvas size stays the same. Press Ctrl+Z to undo.',
+            QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer!=QMessageBox.StandardButton.Yes:return
+        self.checkpoint()
+        empty=capture(self.size_px,[],[],self.traits,{},
+                      self.frames.value(),self.duration.value(),self.loop_count.value(),
+                      self.export_format.currentIndex())
+        empty.update(pet_anchors={},pet_regions={},frame_tracks={'Ink':{}},
+                     motion_keys={},layer_motion_keys={},frame_clips={})
+        self.restore_snapshot(empty)
+        self.statusBar().showMessage('Canvas cleared — Ctrl+Z to undo',4000)
+
+    def export_canvas_png(self):
+        """One-click discoverable still PNG export, independent of project JSON."""
+        path,_=QFileDialog.getSaveFileName(self,'Save canvas as PNG','canvas.png','PNG image (*.png)')
+        if not path:return
+        if not path.lower().endswith('.png'):path+='.png'
+        try:
+            safe_export(path,lambda tmp:composite(self.layers,self.size_px).save(tmp,format='PNG'),self._validate_still_export)
+            self.statusBar().showMessage(f'PNG saved: {path}',5000)
+        except Exception as exc:
+            QMessageBox.warning(self,'PNG export failed',str(exc))
+
     def new_project(self):
         if self._dirty:
             response=QMessageBox.question(self,'Start a new project?',
@@ -976,38 +841,14 @@ class MainWindow(QMainWindow):
         self.restore_snapshot(fresh)
         self.history=UndoHistory()
         self.project_path=None;self._dirty=False
+        # A fresh project supersedes the previous recovery only after reset succeeds.
         self.recovery_path.unlink(missing_ok=True)
         self.sizes.blockSignals(True);self.sizes.setCurrentIndex(1);self.sizes.blockSignals(False)
         self.canvas.reset_zoom()
         self.statusBar().showMessage('New blank project ready',3500)
 
-    def update_pet_suggestions(self, enabled):
-        self.settings.setValue('pet_suggestions',bool(enabled))
-        if hasattr(self,'pet_recipe_group'):
-            self.pet_recipe_group.setVisible(bool(enabled))
 
-    def update_pet_auto_generation(self, enabled):
-        self.settings.setValue('pet_auto_generation',bool(enabled))
-        if hasattr(self,'pet_generate_button'):
-            self.pet_generate_button.setEnabled(bool(enabled))
 
-    def export_manual_pet_sprite(self):
-        # Export one editable starting frame without imposing a body type or preset.
-        try:
-            path=self.pet_template_path.text().strip()
-            if path:
-                with Image.open(path) as loaded: source=loaded.convert('RGBA')
-            else:
-                source=self.current_image().convert('RGBA')
-            folder=QFileDialog.getExistingDirectory(self,'Choose manual sprite sheet folder')
-            if not folder:return
-            name,ok=QInputDialog.getText(self,'Creature name','Export file prefix:',text='my_pet')
-            if not ok:return
-            export_pet_package({'Custom':[source]},folder,name,self.pet_wizard_fps.value(),
-                self.pet_export_frames.isChecked(),False,False,getattr(self,'pet_anchors',{}))
-            QMessageBox.information(self,'Manual sprite sheet ready',f'Exported an editable single-frame custom sprite sheet and JSON to:\n{folder}')
-        except Exception as exc:
-            QMessageBox.critical(self,'Manual sprite sheet export failed',str(exc))
 
     def update_guided_mode(self,enabled):
         self.settings.setValue('guided_mode',bool(enabled))
@@ -1020,172 +861,22 @@ class MainWindow(QMainWindow):
         self.paint_color=(c.red(),c.green(),c.blue(),255)
         self.statusBar().showMessage('Brush color: '+hex_color,2500)
 
-    def toggle_pet_workshop(self):
-        if self.pet_workshop_dock is None:return
-        if self.pet_workshop_dock.isVisible():self.pet_workshop_dock.hide()
-        else:self.pet_workshop_dock.show();self.pet_workshop_dock.raise_()
 
-    def open_creature_rig_builder(self):
-        from .rig_builder_ui import RigBuilderDialog
-        dialog=RigBuilderDialog(self,self.size_px)
-        dialog.exec()
 
-    def choose_pet_template(self):
-        path,_=QFileDialog.getOpenFileName(self,'Choose pet template','','PNG Images (*.png)')
-        if path:self.pet_template_path.setText(path)
 
-    def update_pet_pose_template_hint(self, *args):
-        body_type=self.pet_body_type.currentText()
-        self.pet_pose_template_hint.setText('Suggested editable layers: '+', '.join(POSE_TEMPLATES.get(body_type, ())))
 
-    def update_pet_animation_recipe(self, *args):
-        try:
-            guide=animation_guide(self.pet_recipe_action.currentText(),
-                self.pet_wizard_frames.value(),self.pet_body_type.currentText())
-            self.pet_recipe_text.setText(format_animation_guide(guide))
-        except Exception as exc:
-            self.pet_recipe_text.setText(str(exc))
 
-    def pet_guide_animation_changed(self, action):
-        self.pet_guide_step=0
-        if hasattr(self,'pet_recipe_action'):
-            self.pet_recipe_action.setCurrentText(action)
-        self.refresh_pet_guide()
 
-    def mark_pet_guide_step(self, checked):
-        if not hasattr(self, '_pet_guide_completed'):
-            self._pet_guide_completed={}
-        action=self.pet_guide_action.currentText()
-        completed=self._pet_guide_completed.setdefault(action,set())
-        if checked: completed.add(self.pet_guide_step)
-        else: completed.discard(self.pet_guide_step)
 
-    def open_pet_guide_tool(self):
-        """Activate only the tool needed by the current recipe step."""
-        guide=animation_guide(self.pet_guide_action.currentText(),
-                              self.pet_wizard_frames.value(),self.pet_body_type.currentText())
-        if 1 <= self.pet_guide_step <= len(guide['key_poses']):
-            self.tool.setCurrentText('Frame Pencil')
-            self.advanced_animator_dock.show()
-            self.advanced_animator_dock.raise_()
-        elif self.pet_guide_step == len(guide['key_poses'])+1:
-            self.advanced_animator_dock.show()
-            self.advanced_animator_dock.raise_()
-        elif self.pet_guide_step == len(guide['key_poses'])+2:
-            self.pet_studio_tabs.setCurrentIndex(1)
 
-    def move_pet_guide(self, delta):
-        guide=animation_guide(self.pet_guide_action.currentText(),
-                              self.pet_wizard_frames.value(),self.pet_body_type.currentText())
-        self.pet_guide_step=max(0,min(len(guide['key_poses'])+2,self.pet_guide_step+delta))
-        self.refresh_pet_guide()
 
-    def refresh_pet_guide(self):
-        if not hasattr(self,'pet_guide_title') or not hasattr(self,'pet_wizard_frames'):
-            return
-        guide=animation_guide(self.pet_guide_action.currentText(),
-                              self.pet_wizard_frames.value(),self.pet_body_type.currentText())
-        stages=guide['key_poses']
-        index=self.pet_guide_step
-        total=len(stages)+3
-        if index==0:
-            title='Prepare your creature'
-            details=f"Import a PNG or use the current canvas. For this animation, prepare: {guide['parts_to_prepare']}."
-        elif index<=len(stages):
-            title=f"Draw pose {index}: {stages[index-1]}"
-            details=(f"Create or edit the '{stages[index-1]}' pose using Frame Pencil and duplicate frames as needed. "
-                     f"Recipe tip: {guide['drawing_tip']}")
-        elif index==len(stages)+1:
-            title='Preview and refine the timing'
-            details=(f"Check the motion in Intermediate Studio. Suggested playback: {guide['playback']}. "
-                     'Adjust frames and redraw any parts that do not move naturally.')
-        else:
-            title='Export your sprite sheet'
-            details='Open Advanced / Export to save frames, sprite sheet, GIF, APNG and JSON. Export is never blocked by this guide.'
-        self.pet_guide_progress.setText(f"Step {index+1} of {total} • {guide['action']}")
-        self.pet_guide_title.setText(title)
-        self.pet_guide_instructions.setText(details)
-        self.pet_guide_back.setEnabled(index>0)
-        self.pet_guide_next.setEnabled(index<total-1)
-        labels=['Import or select your creature']+['Open Frame Pencil for this pose']*len(stages)+['Open Intermediate Studio to preview','Open export options']
-        self.pet_guide_tool.setText(labels[index])
-        self.pet_guide_tool.setEnabled(index!=0)
-        completed=getattr(self,'_pet_guide_completed',{}).get(self.pet_guide_action.currentText(),set())
-        self.pet_guide_done.blockSignals(True)
-        self.pet_guide_done.setChecked(index in completed)
-        self.pet_guide_done.blockSignals(False)
-        self.pet_guide_progress.setText(f"Step {index+1} of {total} • {len(completed)}/{total} checked • {guide['action']}")
 
-    def activate_pet_region_selector(self):
-        # Regions are measured in canvas coordinates, not a separately imported PNG.
-        if self.pet_template_path.text().strip():
-            self.statusBar().showMessage('Region selection uses the main canvas. Import the creature onto the canvas first, or clear the template path.',6500)
-            return
-        self.tool.setCurrentText('Pet Region Select')
-        self.statusBar().showMessage('Drag a box around the selected body part on the canvas; release to save.',6000)
 
-    def save_pet_region(self):
-        name=self.pet_region_part.currentText()
-        rect=[spin.value() for spin in self.pet_region_spins]
-        try:
-            path=self.pet_template_path.text().strip()
-            if path:
-                with Image.open(path) as im:size=im.size
-            else:size=self.current_image().size
-            updated={**self.pet_regions,name:rect}
-            self.pet_regions=validate_regions(updated,size)
-            self.refresh_pet_regions()
-        except Exception as exc:
-            QMessageBox.warning(self,'Invalid body region',str(exc))
 
-    def remove_pet_region(self):
-        name=self.pet_region_part.currentText()
-        self.pet_regions.pop(name,None)
-        self.refresh_pet_regions()
 
-    def select_pet_region(self,item):
-        name=item.data(Qt.ItemDataRole.UserRole)
-        self.pet_region_part.setCurrentText(name)
-        for spin,value in zip(self.pet_region_spins,self.pet_regions[name]):spin.setValue(value)
 
-    def refresh_pet_regions(self):
-        if not isValid(getattr(self,'pet_region_list',None)):
-            return
-        with QSignalBlocker(self.pet_region_list):
-            self.pet_region_list.clear()
-            for name,rect in sorted(self.pet_regions.items()):
-                item=QListWidgetItem(f'{name}: {rect}')
-                item.setData(Qt.ItemDataRole.UserRole,name)
-                self.pet_region_list.addItem(item)
 
-    def generate_pet_sprite_package(self):
-        try:
-            path=self.pet_template_path.text().strip()
-            if path:
-                with Image.open(path) as loaded: source=loaded.convert('RGBA')
-            else:
-                source=self.current_image().convert('RGBA')
-            actions=[name for name,check in self.pet_animation_checks.items() if check.isChecked()]
-            if not actions:
-                QMessageBox.warning(self,'No animations','Select at least one animation preset.')
-                return
-            folder=QFileDialog.getExistingDirectory(self,'Choose sprite sheet export folder')
-            if not folder:return
-            name,ok=QInputDialog.getText(self,'Creature name','Export file prefix:',text='my_pet')
-            if not ok:return
-            animations=generate_rigged(source,actions,self.pet_regions,self.pet_wizard_frames.value())
-            export_pet_package(animations,folder,name,self.pet_wizard_fps.value(),
-                self.pet_export_frames.isChecked(),self.pet_export_gif.isChecked(),self.pet_export_apng.isChecked(),
-                {'pose_anchors':getattr(self,'pet_anchors',{}),'body_regions':validate_regions(self.pet_regions,source.size)})
-            if self.pet_suggestions_toggle.isChecked():
-                export_animation_guides(actions,folder,name,self.pet_wizard_frames.value(),self.pet_body_type.currentText())
-            QMessageBox.information(self,'Sprite sheet ready',f'Created {len(actions)} animations in:\n{folder}\n\nPNG sprite sheet + JSON metadata included.')
-        except Exception as exc:
-            QMessageBox.critical(self,'Sprite sheet export failed',str(exc))
 
-    def pet_workshop_visibility_changed(self,visible):
-        # Legacy builder retired; no user-facing button to update.
-        return
 
     def reset_layer_mesh(self):
         layer=self.selected_layer()
@@ -1196,40 +887,9 @@ class MainWindow(QMainWindow):
         self.update_layer_controls();self.invalidate()
         self.statusBar().showMessage('Layer transform reset — artwork pixels preserved.',4000)
 
-    def save_pet_anchor(self):
-        name=self.pet_anchor_name.currentText().strip()
-        if not name:
-            QMessageBox.warning(self,'Missing anchor name','Enter an anchor name.');return
-        self.checkpoint()
-        pose=self.pet_pose.currentText()
-        self.pet_anchors.setdefault(pose,{})[name]=[self.pet_anchor_x.value(),self.pet_anchor_y.value()]
-        self.refresh_pet_anchors()
 
-    def remove_pet_anchor(self):
-        item=self.pet_anchor_list.currentItem()
-        if item is None:return
-        pose=self.pet_pose.currentText();name=item.data(Qt.ItemDataRole.UserRole)
-        if name in self.pet_anchors.get(pose,{}):
-            self.checkpoint();del self.pet_anchors[pose][name];self.refresh_pet_anchors()
 
-    def refresh_pet_anchors(self,*args):
-        if not isValid(getattr(self,'pet_anchor_list',None)) or not isValid(getattr(self,'pet_pose',None)):
-            return
-        # Block selection callbacks while replacing items: Qt may otherwise
-        # emit signals referencing an item that has just been destroyed.
-        with QSignalBlocker(self.pet_anchor_list):
-            self.pet_anchor_list.clear()
-            for name,xy in sorted(self.pet_anchors.get(self.pet_pose.currentText(),{}).items()):
-                item=QListWidgetItem(f'{name}: ({xy[0]}, {xy[1]})')
-                item.setData(Qt.ItemDataRole.UserRole,name)
-                self.pet_anchor_list.addItem(item)
 
-    def select_pet_anchor(self,item):
-        name=item.data(Qt.ItemDataRole.UserRole)
-        xy=self.pet_anchors.get(self.pet_pose.currentText(),{}).get(name)
-        if xy:
-            self.pet_anchor_name.setCurrentText(name)
-            self.pet_anchor_x.setValue(xy[0]);self.pet_anchor_y.setValue(xy[1])
 
     def toggle_nft_manager(self):
         if self.nft_manager_dock.isVisible():
@@ -1272,7 +932,6 @@ class MainWindow(QMainWindow):
             'Mask Eraser':('◌','Brush away highlights; art stays safe','#a7d3ff'),
             'Frame Pencil':('✎','Draw on the selected animation frame','#f5cf9c'),
             'Frame Eraser':('⌫','Erase on the selected animation frame','#ffb9bd'),
-            'Pose Anchor':('⌖','Click to place or drag an attachment anchor','#ffdc8b'),
         }
         symbol,tip,color=labels.get(tool,('•','Click on the canvas','#b9e4c9'))
         self.active_tool_banner.setText(f'{symbol}  {tool}\\n{tip}')
@@ -1420,14 +1079,6 @@ class MainWindow(QMainWindow):
         symbols=['◆' if i in local_keys else '●' if i in global_keys else '·' for i in range(total)]
         self.timeline_markers.setText('Frame markers (◆ layer, ● whole sprite):\n'+' '.join(symbols))
 
-    def preview_pose_transition(self):
-        start=self.pose_start.currentText();end=self.pose_end.currentText()
-        sequence=interpolate_pose_anchors(self.pet_anchors,start,end,self.frames.value())
-        self.pose_transition={'start':start,'end':end,'anchors':sequence}
-        self.pose_transition_preview.setText(f'{start} → {end}: {len(sequence)} interpolated anchor frames.\n'
-            +' | '.join(f'{name}: {pos}' for name,pos in list(sequence[-1].items())[:4])
-            +'\nAnchor motion preview only; artwork pose morphing is not implied.')
-        self.canvas.update()
 
     def timeline_frames(self):
         return compose_layer_motion_frames(self.layers,self.size_px,self.regions,self.frames.value(),self.frame_edits,self.layer_motion_keys,self.motion_keys)
@@ -1496,13 +1147,57 @@ class MainWindow(QMainWindow):
         if keys_i is not None:self.layer_motion_keys[str(j)]=keys_i
         if keys_j is not None:self.layer_motion_keys[str(i)]=keys_j
         item=self.layer_list.takeItem(i);self.layer_list.insertItem(j,item);self.layer_list.setCurrentRow(j);self.invalidate()
+    def update_delete_shortcut_focus(self,old,focused):
+        # Allow text, worksheet and non-layer lists to handle Delete natively.
+        allowed=True
+        current=focused
+        while current is not None:
+            if isinstance(current,(QLineEdit,QTextEdit,QPlainTextEdit,QSpinBox,QDoubleSpinBox,QComboBox)):
+                allowed=False;break
+            if isinstance(current,QAbstractItemView) and current is not self.layer_list:
+                allowed=False;break
+            current=current.parentWidget()
+        self.delete_asset_shortcut.setEnabled(allowed)
+
+    def delete_selected_asset(self):
+        """Delete the selected artwork layer without hijacking text/worksheet editing."""
+        focused=QApplication.focusWidget()
+        if focused is not None:
+            # Keep Delete's native behavior in text editors, combo boxes, and
+            # worksheet/table editors (including child editor widgets).
+            if isinstance(focused,(QLineEdit,QTextEdit,QPlainTextEdit,QSpinBox,QDoubleSpinBox,QComboBox)):
+                return
+            parent=focused
+            while parent is not None:
+                if isinstance(parent,QAbstractItemView) and parent is not self.layer_list:
+                    return
+                parent=parent.parentWidget()
+        if not 0<=self.layer_list.currentRow()<len(self.layers):
+            return
+        self.remove_layer()  # Existing confirmation, undo checkpoint and cleanup.
+
     def remove_layer(self):
         i=self.layer_list.currentRow()
-        if i>=0:
+        # The layer widget may briefly retain a selection during project restore.
+        # Never delete from the model unless its index is still valid.
+        if 0<=i<len(self.layers):
             if QMessageBox.question(self,'Delete layer?','Remove the selected layer? You can undo this with Ctrl+Z.',QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
             self.checkpoint();self.layers.pop(i)
             self.layer_motion_keys={str(int(k)-(int(k)>i)):v for k,v in self.layer_motion_keys.items() if int(k)!=i}
             self.layer_list.takeItem(i);self.invalidate()
+    def add_laser_asset(self):
+        """Create a non-destructive movable animated beam emitter."""
+        w,h=self.size_px
+        x,y=w//2,h//2
+        self.checkpoint()
+        region=Region(f'Laser Eyes {len(self.regions)+1}',(x,y,1,1),effect='Laser Eyes',color=(255,85,85,255))
+        self.regions.append(region)
+        self.region_list.addItem(region.name)
+        self.region_list.setCurrentRow(len(self.regions)-1)
+        self.tool.setCurrentText('Move Laser Asset')
+        self.invalidate()
+        self.statusBar().showMessage('Drag the laser emitter onto an eye; set its color, direction and length in Junior Animator.',6000)
+
     def add_region(self,rect):
         self.checkpoint();r=Region(f'Region {len(self.regions)+1}',rect);self.regions.append(r);self.region_list.addItem(r.name);self.region_list.setCurrentRow(len(self.regions)-1);self.invalidate()
     def delete_region(self):
@@ -1523,7 +1218,7 @@ class MainWindow(QMainWindow):
         c=QColor(hex_color)
         new_color=(c.red(),c.green(),c.blue(),255)
         if self.regions[i].color!=new_color:
-            self.checkpoint();self.regions[i].color=new_color;self.invalidate()
+            self.checkpoint();self.regions[i].color=new_color;self.regions[i].blink_use_color=True;self.invalidate()
         self.update_effect_color_preview()
 
     def update_effect_color_preview(self):
@@ -1532,14 +1227,14 @@ class MainWindow(QMainWindow):
             self.effect_color_preview.setText('Select a region to choose its color')
             return
         rgba=self.regions[i].color
-        self.effect_color_preview.setText('Selected region color: #'+''.join(f'{v:02X}' for v in rgba[:3])+f'  ·  {round(rgba[3]/255*100)}% opacity')
+        self.effect_color_preview.setText('Effect + highlight color: #'+''.join(f'{v:02X}' for v in rgba[:3])+f'  ·  {round(rgba[3]/255*100)}% opacity')
 
     def choose_effect_color(self):
         i=self.region_list.currentRow()
         if not 0<=i<len(self.regions):return
         c=QColorDialog.getColor(QColor(*self.regions[i].color),self,'Effect color',QColorDialog.ColorDialogOption.ShowAlphaChannel)
         if c.isValid():
-            self.checkpoint();self.regions[i].color=(c.red(),c.green(),c.blue(),c.alpha());self.invalidate();self.update_effect_color_preview()
+            self.checkpoint();self.regions[i].color=(c.red(),c.green(),c.blue(),c.alpha());self.regions[i].blink_use_color=True;self.invalidate();self.update_effect_color_preview()
     def update_region_controls(self,*args):
         i=self.region_list.currentRow()
         if 0<=i<len(self.regions):
@@ -1561,7 +1256,7 @@ class MainWindow(QMainWindow):
         self.timeline_mode=False
         self.tool.setCurrentText('Mask Brush')
         self.animator_dock.show()
-        self.statusBar().showMessage('Paint green highlights on the sprite, choose an effect, then press Preview.',8000)
+        self.statusBar().showMessage('Paint colored highlights on the sprite; effect colors also change the highlight overlay.',8000)
 
     def start_preview(self):
         if not self.layers:
@@ -1619,7 +1314,7 @@ class MainWindow(QMainWindow):
         for check in (apng,gif,still):
             check.setChecked(True)
             layout.addWidget(check)
-        note=QLabel('All three are selected by default. Uncheck anything you do not want.')
+        note=QLabel('All three are selected by default. APNG saves as *_animated.apng (not a still PNG). Uncheck anything you do not want.')
         note.setWordWrap(True)
         layout.addWidget(note)
         buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel)
@@ -1641,31 +1336,34 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self,'Invalid filename','Please enter a simple filename without slashes or special characters.')
             return
         output=Path(folder)
-        paths=[output/(name+suffix) for chosen,suffix in zip(selected,('_animated.png','_animated.gif','_still.png')) if chosen]
+        paths=[output/(name+suffix) for chosen,suffix in zip(selected,('_animated.apng','_animated.gif','_still.png')) if chosen]
         if any(path.exists() for path in paths):
             answer=QMessageBox.question(self,'Replace existing files?',
                 'One or more selected files already exist. Replace them?',
                 QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if answer!=QMessageBox.StandardButton.Yes:return
-        frames=self.make_frames() if selected[0] or selected[1] else []
+        try:
+            frames=self.make_frames() if selected[0] or selected[1] else []
+        except Exception as exc:
+            QMessageBox.warning(self,'Animation frames unavailable',
+                'Could not prepare animation frames. No export files were changed.\n\n'+str(exc))
+            return
         saved=[]
         errors=[]
         operations=[
-            (selected[0],output/(name+'_animated.png'),lambda path:export_apng(frames,path,self.duration.value(),self.loop_count.value())),
+            (selected[0],output/(name+'_animated.apng'),lambda path:export_apng(frames,path,self.duration.value(),self.loop_count.value())),
             (selected[1],output/(name+'_animated.gif'),lambda path:export_gif(frames,path,self.duration.value(),self.loop_count.value())),
             (selected[2],output/(name+'_still.png'),lambda path:composite(self.layers,self.size_px).save(path)),
         ]
         for enabled,path,write in operations:
             if not enabled:continue
             try:
-                write(path)
-                if path.name.endswith('_animated.gif') or path.name.endswith('_animated.png'):
-                    with Image.open(path) as check:
-                        if getattr(check,'n_frames',1)<2:
-                            raise RuntimeError('File contains only one frame; choose an effect that changes over time.')
+                validator=self._validate_animated_export if path.suffix in ('.gif','.apng') else self._validate_still_export
+                safe_export(path,write,validator)
                 saved.append(path.name)
             except Exception as exc:
+                # Existing exports survive failures; temporary output is removed.
                 errors.append(f'{path.name}: {exc}')
         if errors:
             QMessageBox.warning(self,'Export needs attention',
@@ -1674,13 +1372,28 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self,'Your sprite is exported! 🎉',
                 'Saved to '+str(output)+'\\n\\n'+'\\n'.join(saved))
 
+    @staticmethod
+    def _validate_still_export(path):
+        with Image.open(path) as check:
+            check.load()
+            if check.width<1 or check.height<1:raise RuntimeError('Invalid image dimensions')
+
+    @staticmethod
+    def _validate_animated_export(path):
+        with Image.open(path) as check:
+            if getattr(check,'n_frames',1)<2:raise RuntimeError('Animation contains only one frame')
+            check.seek(0)
+            first=check.convert('RGBA').tobytes()
+            if not any((check.seek(i) or check.convert('RGBA').tobytes())!=first for i in range(1,check.n_frames)):
+                raise RuntimeError('Animation has no visible frame changes')
+
     def save_gif(self):
         path,_=QFileDialog.getSaveFileName(self,'Export moving GIF','animation.gif','Animated GIF (*.gif)')
         if not path:return
+        if not path.lower().endswith('.gif'):path+='.gif'
         try:
-            export_gif(self.make_frames(),path,self.duration.value(),self.loop_count.value())
-            with Image.open(path) as check:
-                if getattr(check,'n_frames',1)<2:raise RuntimeError('GIF contains only one frame')
+            frames=self.make_frames()
+            safe_export(path,lambda tmp:export_gif(frames,tmp,self.duration.value(),self.loop_count.value()),self._validate_animated_export)
             QMessageBox.information(self,'Moving GIF exported',f'Animated GIF saved to {path}\nOpen in a browser to see it move.')
         except Exception as e:QMessageBox.warning(self,'GIF export failed',str(e))
 
@@ -1688,19 +1401,24 @@ class MainWindow(QMainWindow):
         selected=self.export_format.currentIndex()
         if selected==0:return self.save_apng()
         if selected==3:return self.save_png()
-        frames=self.make_frames()
         if selected==1:return self.save_gif()
         if selected==2:
+            frames=self.make_frames()
             path,_=QFileDialog.getSaveFileName(self,'Export sprite sheet','sprite_sheet.png','PNG (*.png)')
             if not path:return
+            if not path.lower().endswith('.png'):path+='.png'
             try:
-                export_sprite_sheet(frames,path)
+                safe_export(path,lambda tmp:export_sprite_sheet(frames,tmp),self._validate_still_export)
                 QMessageBox.information(self,'Sprite sheet exported',f'Saved {len(frames)} frames to {path}')
             except Exception as e:QMessageBox.warning(self,'Sprite sheet export failed',str(e))
     def save_apng(self):
-        path,_=QFileDialog.getSaveFileName(self,'Export moving APNG','animation.png','Animated PNG (*.png *.apng)')
+        path,_=QFileDialog.getSaveFileName(self,'Export moving APNG','animation.apng','Animated PNG (*.apng *.png)')
         if path:
-            try:export_apng(self.make_frames(),path,self.duration.value(),self.loop_count.value());QMessageBox.information(self,'Moving APNG exported',f'Animated PNG saved to {path}\nThis is an animated PNG (APNG), even if the filename ends in .png. Open in a browser to see it move.')
+            if not path.lower().endswith(('.apng','.png')):path+='.apng'
+            try:
+                frames=self.make_frames()
+                safe_export(path,lambda tmp:export_apng(frames,tmp,self.duration.value(),self.loop_count.value()),self._validate_animated_export)
+                QMessageBox.information(self,'Moving APNG exported',f'Animated PNG saved to {path}\nThis is an animated PNG (APNG). Open in an APNG-compatible viewer or browser to see it move.')
             except Exception as e:QMessageBox.warning(self,'Animation export',str(e))
     def save_png(self):
         path,_=QFileDialog.getSaveFileName(self,'Export STILL image (no animation)','sprite_still.png','Still PNG (*.png)')
@@ -1708,7 +1426,10 @@ class MainWindow(QMainWindow):
             if QMessageBox.question(self,'Export a still image?',
                 'A still PNG will NOT move. For animation, use Export MOVING Sprite (APNG) or Export MOVING GIF.\n\nSave one still frame anyway?',
                 QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
-            composite(self.layers,self.size_px).save(path)
+            if not path.lower().endswith('.png'):path+='.png'
+            try:
+                safe_export(path,lambda tmp:composite(self.layers,self.size_px).save(tmp,format='PNG'),self._validate_still_export)
+            except Exception as e:QMessageBox.warning(self,'PNG export failed',str(e))
     def open_worksheet(self):
         path,_=QFileDialog.getOpenFileName(self,'Open NFT worksheet','','Worksheets (*.xlsx *.csv)')
         if not path:return
@@ -1815,11 +1536,14 @@ class MainWindow(QMainWindow):
             self.frames.setValue(obj.get('frame_count',8));self.duration.setValue(obj.get('frame_duration',100))
             self.loop_count.setValue(obj.get('animation_loops',0));self.export_format.setCurrentIndex(obj.get('export_format',0))
             self.timeline_mode=bool(self.frame_edits)
-            self.layer_list.clear();self.layer_list.addItems([l.name for l in layers])
-            self.region_list.clear();self.region_list.addItems([r.name for r in regions])
-            if layers:self.layer_list.setCurrentRow(len(layers)-1)
-            if regions:self.region_list.setCurrentRow(0)
-            self.refresh_traits();self.refresh_pet_anchors();self.refresh_pet_regions();self.invalidate()
+            # Snapshot restore replaces model objects. Do not emit selection
+            # callbacks while the associated Qt list items are being destroyed.
+            with QSignalBlocker(self.layer_list), QSignalBlocker(self.region_list):
+                self.layer_list.clear();self.layer_list.addItems([l.name for l in layers])
+                self.region_list.clear();self.region_list.addItems([r.name for r in regions])
+                if layers:self.layer_list.setCurrentRow(len(layers)-1)
+                if regions:self.region_list.setCurrentRow(0)
+            self.refresh_traits();self.invalidate()
         finally:
             self._restoring=False
 
@@ -1836,12 +1560,20 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage('Redone',3000)
 
     def write_recovery(self):
-        if not self._dirty:return
+        """Return whether unsaved work is safely backed up.
+
+        A failed write must never be treated as a successful recovery save
+        when the user closes the application.
+        """
+        if not self._dirty:return True
         try:
             atomic_write(self.recovery_path,self.snapshot())
             self.statusBar().showMessage('Recovery backup saved automatically',2500)
+            return True
         except Exception as exc:
+            logging.getLogger('slimehouse').exception('Recovery backup failed')
             self.statusBar().showMessage(f'Automatic recovery backup failed: {exc}',7000)
+            return False
 
     def offer_recovery(self):
         if not self.recovery_path.exists():return
@@ -1852,7 +1584,10 @@ class MainWindow(QMainWindow):
             try:
                 self.restore_snapshot(json.loads(self.recovery_path.read_text(encoding='utf-8')))
                 self._dirty=True
-            except Exception as exc:QMessageBox.warning(self,'Recovery failed',str(exc))
+            except Exception as exc:
+                logging.getLogger('slimehouse').exception('Recovery restore failed')
+                QMessageBox.warning(self,'Recovery failed',
+                    f'{exc}\n\nThe recovery file has been preserved so you can retry.')
         else:
             self.recovery_path.unlink(missing_ok=True)
 
@@ -1894,7 +1629,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self,event):
         if self._dirty:
-            self.write_recovery()
+            if not self.write_recovery():
+                QMessageBox.warning(self,'Recovery backup failed',
+                    'Your unsaved work could not be backed up. The application will stay open.\n'
+                    'Please use Save Project to save your artwork before closing.')
+                event.ignore();return
             choice=QMessageBox.question(self,'Unsaved changes',
                 'Your work has unsaved changes. Close with a recovery backup?\n\nChoose No to stay and save your project.',
                 QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)

@@ -1,61 +1,86 @@
-
-name: Build Windows EXE
-
+name: Build Slime House Studios v0.6 (Portable and Installer)
 on:
+  workflow_dispatch:
+  release:
+    types: [published]
   push:
     branches: [main]
-  workflow_dispatch:
-
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        shell: pwsh
+          python-version: '3.12'
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Run automated tests
+          pip install pytest
+      - name: Run tests
+        run: python -m unittest discover -s tests -q
+      - name: Run pytest regression suite
+        run: python -m pytest tests -q
+      - name: Windows GUI stability smoke test
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: python -m tests.windows_gui_smoke
+      - name: Build portable EXE
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name SlimeHouseStudios --icon assets/slime_house_studios.ico --add-data "assets;assets" main.py
+      - name: Install Inno Setup if needed
         shell: pwsh
         run: |
-          python -m unittest discover -s tests -q
-
-      - name: Build Slime House Studios EXE
+          if (-not (Test-Path '${{ github.workspace }}\installer.iss')) { throw 'Missing installer.iss' }
+          if (-not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')) { choco install innosetup --yes --no-progress }
+      - name: Build installer
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
+      - name: Smoke-test installed application and uninstall
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name SlimeHouseStudios --icon assets/slime_house_studios.ico --add-data "assets;assets" --collect-all PySide6 main.py
-      - name: Build Windows installer
+          $setup = (Resolve-Path 'installer-output/SlimeHouseStudios-v0.6-Setup.exe').Path
+          $installDir = Join-Path $env:RUNNER_TEMP 'SlimeHouseStudios-v0.6-install-test'
+          $process = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$installDir") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer exited with code $($process.ExitCode)" }
+          $installedExe = Join-Path $installDir 'SlimeHouseStudios.exe'
+          if (-not (Test-Path $installedExe)) { throw 'Installed application missing' }
+          $uninstaller = Join-Path $installDir 'unins000.exe'
+          if (-not (Test-Path $uninstaller)) { throw 'Uninstaller missing' }
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller exited with code $($uninstall.ExitCode)" }
+          if (Test-Path $installedExe) { throw 'Installed EXE still present after uninstall' }
+      - name: Validate packaged Windows artifacts
         shell: pwsh
         run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (Test-Path $iscc) {
-            & $iscc "installer.iss"
-          } else {
-            Write-Host "Inno Setup is not installed; skipping installer."
+          $exe = 'dist/SlimeHouseStudios.exe'
+          $setup = 'installer-output/SlimeHouseStudios-v0.6-Setup.exe'
+          foreach ($path in @($exe, $setup)) {
+            if (-not (Test-Path $path)) { throw "Missing build artifact: $path" }
+            $item = Get-Item $path
+            if ($item.Length -lt 100KB) { throw "Unexpectedly small artifact: $path ($($item.Length) bytes)" }
+            $hash = (Get-FileHash -Algorithm SHA256 $path).Hash
+            Write-Host "$path | $($item.Length) bytes | SHA256 $hash"
           }
-
-      - name: Upload Windows EXE
+          $portable = Get-Item $exe
+          if ($portable.Extension -ne '.exe') { throw 'Portable build has unexpected extension' }
+      - name: Upload portable application
         uses: actions/upload-artifact@v4
         with:
-          name: SlimeHouseStudios-Windows-Phase1-Test
+          name: SlimeHouseStudios-Portable-Windows
           path: dist/SlimeHouseStudios.exe
           if-no-files-found: error
-      
-      - name: Upload Windows installer
-        if: ${{ hashFiles('dist/*Setup*.exe') != '' }}
+      - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
           name: SlimeHouseStudios-Installer-Windows
-          path: dist/*Setup*.exe
+          path: installer-output/SlimeHouseStudios-v0.6-Setup.exe
           if-no-files-found: error
+      - name: Publish v0.6 release assets
+        if: github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v0.6')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: gh release upload "${{ github.event.release.tag_name }}" "dist/SlimeHouseStudios.exe#SlimeHouseStudios-v0.6-Portable.exe" "installer-output/SlimeHouseStudios-v0.6-Setup.exe" --clobber
