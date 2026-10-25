@@ -27,7 +27,10 @@ jobs:
 
       - name: Run tests
         run: python -m unittest discover -s tests -q
+
+      - name: Run pytest regression suite
         run: python -m pytest tests -q
+
       - name: Windows GUI stability smoke test
         run: python -m tests.windows_gui_smoke
       - name: Build portable EXE
