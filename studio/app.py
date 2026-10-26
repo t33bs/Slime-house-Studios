@@ -345,7 +345,9 @@ class MainWindow(QMainWindow):
             palette_row.addWidget(swatch)
         lv.addWidget(palette)
         lv.addWidget(QLabel('YOUR ACTIVE TOOL'))
-        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Pencil','Paint Bucket','Eraser','Eyedropper','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser']);lv.addWidget(self.tool)
+       
+        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Move Laser Asset','Pencil','Paint Bucket','Eraser','Eyedropper','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser']);lv.addWidget(self.tool)
+
         self.active_tool_banner=QLabel('↔  Move / Transform  ·  Drag artwork to move it')
         self.active_tool_banner.setObjectName('activeToolBanner')
         self.active_tool_banner.setWordWrap(True)
