@@ -7,10 +7,6 @@ on:
     branches: [main]
 permissions:
   contents: write
-
-env:
-  PYTHONUTF8: "1"
-
 jobs:
   build:
     runs-on: windows-latest
@@ -24,14 +20,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest
-
       - name: Run tests
         run: python -m unittest discover -s tests -q
-
       - name: Run pytest regression suite
         run: python -m pytest tests -q
-
       - name: Windows GUI stability smoke test
+        env:
+          PYTHONUNBUFFERED: '1'
         run: python -m tests.windows_gui_smoke
       - name: Build portable EXE
         run: pyinstaller --noconfirm --clean --onefile --windowed --name SlimeHouseStudios --icon assets/slime_house_studios.ico --add-data "assets;assets" main.py

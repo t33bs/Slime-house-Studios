@@ -1,5 +1,5 @@
 """Slime House Studios native Qt editor."""
-import base64, io, json, sys, csv, traceback, faulthandler, logging
+import base64, io, json, sys, csv, traceback, faulthandler, logging, math, random
 from pathlib import Path
 from PIL import Image
 from PySide6.QtCore import Qt, QRect, QTimer, QSettings, QSignalBlocker, QThread, Signal
@@ -22,11 +22,11 @@ def qimage(im):
 # Tiny high-contrast tool cursors, drawn locally so the EXE needs no extra assets.
 # The small crosshair is the exact canvas interaction point (hotspot 5,5).
 CURSOR_SYMBOLS={
-    'Paint Bucket':'▨','Pencil':'✎','Eraser':'⌫','Mask Brush':'✦','Mask Eraser':'◇',
+    'Spray Can':'✺','Paint Bucket':'▨','Pencil':'✎','Eraser':'⌫','Mask Brush':'✦','Mask Eraser':'◇',
     'Frame Pencil':'✎','Frame Eraser':'⌫','Eyedropper':'◉','Animation Region':'▭',
 }
 CURSOR_COLORS={
-    'Paint Bucket':'#a8f5d0','Pencil':'#ffe3a1','Eraser':'#ffb6b6','Mask Brush':'#91e6bb',
+    'Spray Can':'#b7f6d1','Paint Bucket':'#a8f5d0','Pencil':'#ffe3a1','Eraser':'#ffb6b6','Mask Brush':'#91e6bb',
     'Mask Eraser':'#a7d3ff','Frame Pencil':'#f5cf9c',
     'Frame Eraser':'#ffb9bd','Eyedropper':'#c4b5fd','Animation Region':'#d5bbef',
 }
@@ -107,6 +107,16 @@ class Canvas(QWidget):
                 outline=QColor(int(rgba[0]),int(rgba[1]),int(rgba[2]),max(110,int(rgba[3])))
                 p.setPen(QPen(outline,1))
                 for px,py in reg.mask:p.fillRect(self.rect_screen((px,py,1,1)),overlay)
+            if m.tool.currentText()=='Move Laser Asset' and 0<=m.region_list.currentRow()<len(m.regions):
+                reg=m.regions[m.region_list.currentRow()]
+                if reg.effect=='Laser Eyes':
+                    cx=reg.rect[0]+reg.rect[2]//2;cy=reg.rect[1]+reg.rect[3]//2
+                    a=math.radians(reg.beam_angle);distance=max(5,reg.beam_length)
+                    ex=cx+math.cos(a)*distance;ey=cy+math.sin(a)*distance
+                    center=self.rect_screen((cx,cy,1,1)).center();endpoint=self.rect_screen((ex,ey,1,1)).center()
+                    p.setPen(QPen(QColor('#ffdf77'),2,Qt.PenStyle.DashLine));p.drawLine(center,endpoint)
+                    p.setPen(QPen(QColor('#161a22'),2));p.setBrush(QColor('#ff6f85'));p.drawEllipse(center,7,7)
+                    p.setBrush(QColor('#ffe58d'));p.drawEllipse(endpoint,7,7)
             if self.drag and self.drag[0]=='region':
                 a=self.drag[1];b=self.drag[2];p.setPen(QPen(QColor('#f3d3fc'),2));p.drawRect(self.rect_screen((min(a[0],b[0]),min(a[1],b[1]),abs(a[0]-b[0])+1,abs(a[1]-b[1])+1)))
 
@@ -150,11 +160,24 @@ class Canvas(QWidget):
             idx=m.region_list.currentRow()
             if 0<=idx<len(m.regions) and m.regions[idx].effect=='Laser Eyes':
                 m.checkpoint()
-                self.drag=['laser-asset',x,y,tuple(m.regions[idx].rect),idx]
+                reg=m.regions[idx];cx=reg.rect[0]+reg.rect[2]//2;cy=reg.rect[1]+reg.rect[3]//2
+                a=math.radians(reg.beam_angle)
+                ex=cx+math.cos(a)*max(5,reg.beam_length);ey=cy+math.sin(a)*max(5,reg.beam_length)
+                if math.hypot(x-ex,y-ey)<=max(3,9/max(1,self.zoom)):
+                    self.drag=['laser-angle',idx]
+                else:
+                    self.drag=['laser-asset',x,y,tuple(reg.rect),idx]
                 e.accept()
             else:
                 m.statusBar().showMessage('Select a Laser Eyes asset first.',3000)
             return
+        if tool=='Spray Can':
+            if not (0<=x<m.size_px[0] and 0<=y<m.size_px[1]):return
+            if l is None:
+                m.add_layer(Layer('Paint layer',Image.new('RGBA',m.size_px)));l=m.selected_layer()
+            if l.angle%360 or l.scale!=1:
+                m.statusBar().showMessage('Spray Can requires scale 100% and rotation 0°.',3500);return
+            m.timeline_mode=False;m.stop_preview();m.checkpoint();self.drag=['spray'];self.spray_at(x,y);return
         if tool=='Paint Bucket':
             if not (0<=x<m.size_px[0] and 0<=y<m.size_px[1]):return
             if l is None:
@@ -257,6 +280,17 @@ class Canvas(QWidget):
                     else:pixels.add((xx,yy))
         reg.mask=[list(pt) for pt in sorted(pixels)]
         m.invalidate()
+    def spray_at(self,x,y):
+        m=self.main;l=m.selected_layer()
+        if l is None or not (0<=x<m.size_px[0] and 0<=y<m.size_px[1]):return
+        radius=m.spray_radius.value();count=m.spray_density.value()
+        pixels=l.image.load()
+        for _ in range(count):
+            a=random.random()*math.tau;r=radius*math.sqrt(random.random())
+            px=round(x+math.cos(a)*r)-l.x;py=round(y+math.sin(a)*r)-l.y
+            if 0<=px<l.image.width and 0<=py<l.image.height:pixels[px,py]=m.paint_color
+        m.invalidate()
+
     def paint_at(self,x,y,erase=False):
         m=self.main;l=m.selected_layer()
         if l is None:return
@@ -280,6 +314,15 @@ class Canvas(QWidget):
                 m.regions[idx].rect=(nx,ny,w,h)
                 m.invalidate()
             return
+        if mode=='laser-angle':
+            idx=self.drag[1]
+            if 0<=idx<len(m.regions):
+                r=m.regions[idx];cx=r.rect[0]+r.rect[2]//2;cy=r.rect[1]+r.rect[3]//2
+                if x!=cx or y!=cy:
+                    r.beam_angle=round(math.degrees(math.atan2(y-cy,x-cx)))%360
+                    m.update_region_controls();m.invalidate()
+            return
+        if mode=='spray':self.spray_at(x,y);return
         if mode=='paint':self.paint_at(x,y);return
         if mode=='framepaint':self.frame_paint_at(x,y);return
         if mode=='mask':self.mask_at(x,y);return
@@ -327,6 +370,8 @@ class MainWindow(QMainWindow):
         png_button.clicked.connect(self.export_canvas_png);save_actions.addWidget(png_button)
         project_button=QPushButton('Save Project');project_button.setToolTip('Save editable layers and animation settings as JSON')
         project_button.clicked.connect(self.save_project);save_actions.addWidget(project_button)
+        recenter=QPushButton('⌖ Recenter Canvas');recenter.setToolTip('Reset zoom and pan to fit the artwork in the center')
+        recenter.clicked.connect(self.canvas_recenter);lv.addWidget(recenter)
         b=QPushButton('Import PNG layer');b.clicked.connect(self.import_png);lv.addWidget(b)
         b=QPushButton('New blank paint layer');b.clicked.connect(self.new_layer);lv.addWidget(b)
         self.layer_list=QListWidget();self.layer_list.currentRowChanged.connect(self.update_layer_controls);self.layer_list.currentRowChanged.connect(self.refresh_layer_motion);lv.addWidget(self.layer_list)
@@ -345,7 +390,7 @@ class MainWindow(QMainWindow):
             palette_row.addWidget(swatch)
         lv.addWidget(palette)
         lv.addWidget(QLabel('YOUR ACTIVE TOOL'))
-        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Pencil','Paint Bucket','Eraser','Eyedropper','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser']);lv.addWidget(self.tool)
+        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Move Laser Asset','Pencil','Spray Can','Paint Bucket','Eraser','Eyedropper','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser']);lv.addWidget(self.tool)
         self.active_tool_banner=QLabel('↔  Move / Transform  ·  Drag artwork to move it')
         self.active_tool_banner.setObjectName('activeToolBanner')
         self.active_tool_banner.setWordWrap(True)
@@ -366,10 +411,11 @@ class MainWindow(QMainWindow):
         self.scale.setRange(.1,16);self.scale.setSingleStep(.1);self.scale.setValue(1)
         self.angle.setRange(0,359);self.angle.setSingleStep(15)
         form=QFormLayout();lv.addLayout(form)
-        for name,spin in [('Brush (px)',self.brush),('Layer X',self.x),('Layer Y',self.y),('Scale',self.scale),('Rotation °',self.angle)]:form.addRow(name,spin)
+        self.spray_radius=QSpinBox();self.spray_radius.setRange(1,64);self.spray_radius.setValue(8)
+        self.spray_density=QSpinBox();self.spray_density.setRange(1,150);self.spray_density.setValue(16)
+        for name,spin in [('Spray radius (px)',self.spray_radius),('Spray density',self.spray_density),('Brush (px)',self.brush),('Layer X',self.x),('Layer Y',self.y),('Scale',self.scale),('Rotation °',self.angle)]:form.addRow(name,spin)
         for spin in (self.x,self.y,self.scale,self.angle):spin.valueChanged.connect(self.apply_layer_controls)
         self.canvas=Canvas(self);layout.addWidget(self.canvas,1)
-        self.tabs=QTabWidget();self.tabs.setMinimumWidth(240);self.tabs.setMaximumWidth(395);layout.addWidget(self.tabs)
         self.animator_dock=QDockWidget('Junior Animator — Quick Effects',self)
         self.animator_dock.setObjectName('JuniorAnimatorDock')
         self.animator_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.BottomDockWidgetArea)
@@ -423,6 +469,7 @@ class MainWindow(QMainWindow):
         self.effect=QComboBox();self.effect.addItems(EFFECTS);self.effect.currentIndexChanged.connect(self.apply_region_controls)
         self.strength=QSpinBox();self.strength.setRange(1,40);self.strength.setValue(2);self.strength.valueChanged.connect(self.apply_region_controls)
         self.laser_direction=QComboBox();self.laser_direction.addItems(['Right','Left','Up','Down','Radial']);self.laser_direction.currentIndexChanged.connect(self.apply_region_controls)
+        self.laser_angle=QSpinBox();self.laser_angle.setRange(0,359);self.laser_angle.setSuffix('°');self.laser_angle.valueChanged.connect(self.apply_region_controls)
         self.laser_length=QSpinBox();self.laser_length.setRange(1,2048);self.laser_length.setValue(18);self.laser_length.valueChanged.connect(self.apply_region_controls)
         self.particles=QSpinBox();self.particles.setRange(1,250);self.particles.setValue(12);self.particles.valueChanged.connect(self.apply_region_controls)
         self.gush_speed=QSpinBox();self.gush_speed.setRange(1,20);self.gush_speed.setValue(2);self.gush_speed.valueChanged.connect(self.apply_region_controls)
@@ -456,7 +503,7 @@ class MainWindow(QMainWindow):
         self.advanced_effects=QGroupBox('Advanced Effect Controls (optional)')
         self.advanced_effects.setCheckable(True);self.advanced_effects.setChecked(False)
         advanced_form=QFormLayout(self.advanced_effects)
-        for name,ctrl in [('Laser / gush direction',self.laser_direction),('Beam / gush distance',self.laser_length),('Gush particles',self.particles),('Gush speed',self.gush_speed),('Start frame',self.start_frame),('Active frames (0 = all)',self.active_frames),('Cycle frames (0 = timeline)',self.cycle_frames),('Phase offset',self.phase_offset)]:advanced_form.addRow(name,ctrl)
+        for name,ctrl in [('Laser / gush direction',self.laser_direction),('Laser beam angle (0° right)',self.laser_angle),('Beam / gush distance',self.laser_length),('Gush particles',self.particles),('Gush speed',self.gush_speed),('Start frame',self.start_frame),('Active frames (0 = all)',self.active_frames),('Cycle frames (0 = timeline)',self.cycle_frames),('Phase offset',self.phase_offset)]:advanced_form.addRow(name,ctrl)
         advanced_form.addRow(self.repeat_effect)
         av.addWidget(self.advanced_effects)
         av.addWidget(QLabel('Regions render together, in list order. Overlapping effects combine.'))
@@ -592,10 +639,6 @@ class MainWindow(QMainWindow):
             b=QPushButton(text);b.clicked.connect(fn);nv.addWidget(b)
         self.quantity=QSpinBox();self.quantity.setRange(1,10000);self.quantity.setValue(10);nv.addWidget(QLabel('NFT combinations'));nv.addWidget(self.quantity)
         b=QPushButton('Generate unique metadata CSV + JSON');b.clicked.connect(self.generate_nfts);nv.addWidget(b);nv.addStretch()
-        proj=QWidget();pv=QVBoxLayout(proj);self.tabs.addTab(proj,'Project')
-        for text,fn in [('Save editable project',self.save_project),('Open editable project',self.load_project)]:
-            b=QPushButton(text);b.clicked.connect(fn);pv.addWidget(b)
-        pv.addWidget(QLabel('Project files include layers, transforms, regions and traits.'));pv.addStretch()
         self.animator_dock.hide()
         self.advanced_animator_dock.hide()
         self.nft_manager_dock.hide()
@@ -719,6 +762,9 @@ class MainWindow(QMainWindow):
             from PySide6.QtGui import QDesktopServices
             from PySide6.QtCore import QUrl
             QDesktopServices.openUrl(QUrl(payload['installer_url']))
+
+    def canvas_recenter(self):
+        self.canvas.reset_zoom();self.statusBar().showMessage('Canvas centered and fitted to window.',3000)
 
     def adjust_canvas_zoom(self,direction):
         if not hasattr(self,'canvas'):return
@@ -924,6 +970,8 @@ class MainWindow(QMainWindow):
         # silently deselect the art and leave the user wondering what happened.
         labels={
             'Move / Transform':('↔','Drag artwork to move, resize or rotate','#b9e4c9'),
+            'Spray Can':('✺','Scatter crisp pixels with adjustable radius and density','#b7f6d1'),
+            'Move Laser Asset':('↗','Drag pink emitter; drag yellow aim handle to rotate','#ffe58d'),
             'Pencil':('✏','Draw on your selected layer','#ffe3a1'),
             'Eyedropper':('◉','Click a visible pixel to sample its color (I)','#c4b5fd'),
             'Eraser':('⌫','Erase artwork on your selected layer','#ffb6b6'),
@@ -1238,7 +1286,7 @@ class MainWindow(QMainWindow):
     def update_region_controls(self,*args):
         i=self.region_list.currentRow()
         if 0<=i<len(self.regions):
-            r=self.regions[i];self.effect.blockSignals(True);self.effect.setCurrentText(r.effect);self.effect.blockSignals(False);self.strength.blockSignals(True);self.strength.setValue(r.strength);self.strength.blockSignals(False);self.laser_direction.blockSignals(True);self.laser_direction.setCurrentText(r.direction);self.laser_direction.blockSignals(False);self.laser_length.blockSignals(True);self.laser_length.setValue(r.beam_length);self.laser_length.blockSignals(False);self.particles.blockSignals(True);self.particles.setValue(r.particle_count);self.particles.blockSignals(False);self.gush_speed.blockSignals(True);self.gush_speed.setValue(r.speed);self.gush_speed.blockSignals(False);
+            r=self.regions[i];self.effect.blockSignals(True);self.effect.setCurrentText(r.effect);self.effect.blockSignals(False);self.strength.blockSignals(True);self.strength.setValue(r.strength);self.strength.blockSignals(False);self.laser_direction.blockSignals(True);self.laser_direction.setCurrentText(r.direction);self.laser_direction.blockSignals(False);self.laser_angle.blockSignals(True);self.laser_angle.setValue(r.beam_angle);self.laser_angle.blockSignals(False);self.laser_length.blockSignals(True);self.laser_length.setValue(r.beam_length);self.laser_length.blockSignals(False);self.particles.blockSignals(True);self.particles.setValue(r.particle_count);self.particles.blockSignals(False);self.gush_speed.blockSignals(True);self.gush_speed.setValue(r.speed);self.gush_speed.blockSignals(False);
             for widget,value in [(self.start_frame,r.start_frame),(self.active_frames,r.active_frames),(self.cycle_frames,r.cycle_frames),(self.phase_offset,r.phase_offset)]:
                 widget.blockSignals(True);widget.setValue(value);widget.blockSignals(False)
             self.repeat_effect.blockSignals(True);self.repeat_effect.setChecked(r.repeat);self.repeat_effect.blockSignals(False)
@@ -1246,7 +1294,7 @@ class MainWindow(QMainWindow):
         self.canvas.update()
     def apply_region_controls(self,*args):
         i=self.region_list.currentRow()
-        if 0<=i<len(self.regions):self.regions[i].effect=self.effect.currentText();self.regions[i].strength=self.strength.value();self.regions[i].direction=self.laser_direction.currentText();self.regions[i].beam_length=self.laser_length.value();self.regions[i].particle_count=self.particles.value();self.regions[i].speed=self.gush_speed.value();self.regions[i].start_frame=self.start_frame.value();self.regions[i].active_frames=self.active_frames.value();self.regions[i].cycle_frames=self.cycle_frames.value();self.regions[i].phase_offset=self.phase_offset.value();self.regions[i].repeat=self.repeat_effect.isChecked();self.invalidate()
+        if 0<=i<len(self.regions):self.regions[i].effect=self.effect.currentText();self.regions[i].strength=self.strength.value();self.regions[i].direction=self.laser_direction.currentText();self.regions[i].beam_length=self.laser_length.value();self.regions[i].beam_angle=self.laser_angle.value();self.regions[i].particle_count=self.particles.value();self.regions[i].speed=self.gush_speed.value();self.regions[i].start_frame=self.start_frame.value();self.regions[i].active_frames=self.active_frames.value();self.regions[i].cycle_frames=self.cycle_frames.value();self.regions[i].phase_offset=self.phase_offset.value();self.regions[i].repeat=self.repeat_effect.isChecked();self.invalidate()
     def make_frames(self):return self.timeline_frames()
     def begin_highlighting(self):
         if not self.regions:

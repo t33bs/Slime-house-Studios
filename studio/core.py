@@ -25,6 +25,7 @@ class Region:
     enabled: bool = True
     direction: str = "Right"
     beam_length: int = 18
+    beam_angle: int = 0
     mask: list = field(default_factory=list)  # freehand pixel coordinates, canvas-space
     particle_count: int = 12
     speed: int = 2
@@ -155,7 +156,8 @@ def apply_region(frame,region,i,count):
         if intensity>0.1:
             d=ImageDraw.Draw(frame)
             direction=region.direction.lower()
-            dx,dy={'right':(1,0),'left':(-1,0),'up':(0,-1),'down':(0,1)}.get(direction,(1,0))
+            angle=math.radians(region.beam_angle)
+            dx,dy=math.cos(angle),math.sin(angle)
             length=max(1,round(max(1,min(2048,int(region.beam_length)))*intensity))
             ox=x+w//2;oy=y+h//2
             col=tuple(region.color)
