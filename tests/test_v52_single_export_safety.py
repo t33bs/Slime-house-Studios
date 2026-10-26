@@ -7,7 +7,7 @@ import tempfile
 
 class TestSingleFormatExportSafety(unittest.TestCase):
     def test_each_entrypoint_uses_safe_export(self):
-        source=(Path(__file__).resolve().parents[1]/'studio'/'app.py').read_text()
+        source=(Path(__file__).resolve().parents[1]/'studio'/'app.py').read_text(encoding="utf-8")
         tree=ast.parse(source)
         app=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='MainWindow') if any(isinstance(n,ast.ClassDef) and n.name=='MainWindow' for n in tree.body) else None
         # Find methods independently of class naming.
