@@ -65,19 +65,6 @@ class UpdateCheckWorker(QThread):
         except Exception as exc:
             self.completed.emit(None, str(exc))
 
-class ShortcutToolCombo(QComboBox):
-    """Show hotkeys without changing existing tool names used by the editor."""
-    def currentText(self):
-        return self.currentData() or super().currentText()
-
-    def setCurrentText(self, name):
-        for index in range(self.count()):
-            if self.itemData(index) == name:
-                self.setCurrentIndex(index)
-                return
-        super().setCurrentText(name)
-
-
 class Canvas(QWidget):
     def __init__(self,main):
         super().__init__();self.main=main;self.setMinimumSize(260,260);self.drag=None;self.setMouseTracking(True);self.zoom_factor=1.0;self.zoom_focus=None
@@ -357,7 +344,7 @@ class MainWindow(QMainWindow):
         super().__init__();self.setWindowTitle('Slime House Studios — Pixel Art & Animation');self.setWindowIcon(QIcon(str(resource_path('assets/slime_mascot.png'))));self.resize(1450,860)
         self._last_window_state='normal'
         self.settings=QSettings('Slime House Studios','Studio');self.pet_anchors={};self.pet_regions={};self.frame_tracks={'Ink':{}};self.motion_keys={};self.layer_motion_keys={};self.pose_transition=None;self.frame_clips={};self.worksheet=NFTWorksheet();self.worksheet_row=None;self.size_px=(64,64);self.layers=[];self.regions=[];self.traits={};self.preview=[];self.index=0;self.frame_edits={};self.timeline_mode=False;self.paint_color=(169,229,188,255)
-        self.history=UndoHistory();self._restoring=False;self._dirty=False;self.project_path=None
+        self.history=UndoHistory();self._restoring=False;self._dirty=False;self.project_path=None;self.external_png_path=None
         self.recovery_path=Path.home()/'.slime_house_studios'/'recovery.json'
         self.autosave_timer=QTimer(self);self.autosave_timer.setInterval(60000);self.autosave_timer.timeout.connect(self.write_recovery);self.autosave_timer.start()
         self.timer=QTimer(self);self.timer.timeout.connect(self.next_frame)
@@ -383,6 +370,10 @@ class MainWindow(QMainWindow):
         png_button.clicked.connect(self.export_canvas_png);save_actions.addWidget(png_button)
         project_button=QPushButton('Save Project');project_button.setToolTip('Save editable layers and animation settings as JSON')
         project_button.clicked.connect(self.save_project);save_actions.addWidget(project_button)
+        self.external_save_button=QPushButton('Save Back to Animator PNG')
+        self.external_save_button.setToolTip('Save the current canvas to the PNG opened from Friendly Animator; does not overwrite a project JSON')
+        self.external_save_button.clicked.connect(self.save_external_png)
+        self.external_save_button.setVisible(False);lv.addWidget(self.external_save_button)
         recenter=QPushButton('⌖ Recenter Canvas');recenter.setToolTip('Reset zoom and pan to fit the artwork in the center')
         recenter.clicked.connect(self.canvas_recenter);lv.addWidget(recenter)
         b=QPushButton('Import PNG layer');b.clicked.connect(self.import_png);lv.addWidget(b)
@@ -403,11 +394,7 @@ class MainWindow(QMainWindow):
             palette_row.addWidget(swatch)
         lv.addWidget(palette)
         lv.addWidget(QLabel('YOUR ACTIVE TOOL'))
-        self.tool=ShortcutToolCombo()
-        self.tool_hotkeys={'Move / Transform':'M','Move Laser Asset':'1','Pencil':'P','Spray Can':'2','Paint Bucket':'3','Eraser':'E','Eyedropper':'I','Animation Region':'4','Mask Brush':'B','Mask Eraser':'5','Frame Pencil':'6','Frame Eraser':'7'}
-        for name,key in self.tool_hotkeys.items():
-            self.tool.addItem(f'{name} ({key})',name)
-        lv.addWidget(self.tool)
+        self.tool=QComboBox();self.tool.addItems(['Move / Transform','Move Laser Asset','Pencil','Spray Can','Paint Bucket','Eraser','Eyedropper','Animation Region','Mask Brush','Mask Eraser','Frame Pencil','Frame Eraser']);lv.addWidget(self.tool)
         self.active_tool_banner=QLabel('↔  Move / Transform  ·  Drag artwork to move it')
         self.active_tool_banner.setObjectName('activeToolBanner')
         self.active_tool_banner.setWordWrap(True)
@@ -514,7 +501,7 @@ class MainWindow(QMainWindow):
         self.effect_color_preview=QLabel('Select a region to choose its color')
         av.addWidget(self.effect_color_preview)
         self.frames=QSpinBox();self.frames.setRange(2,120);self.frames.setValue(12)
-        self.duration=QSpinBox();self.duration.setRange(20,2000);self.duration.setValue(250)
+        self.duration=QSpinBox();self.duration.setRange(20,2000);self.duration.setValue(100)
         f=QFormLayout();av.addLayout(f)
         for name,ctrl in [('Effect',self.effect),('Strength / travel',self.strength)]:f.addRow(name,ctrl)
         self.advanced_effects=QGroupBox('Advanced Effect Controls (optional)')
@@ -530,18 +517,11 @@ class MainWindow(QMainWindow):
         self.speed_preset=QComboBox();self.speed_preset.addItems(['Custom','Slow (5 FPS)','Normal (10 FPS)','Smooth (15 FPS)','Fast (24 FPS)','Very fast (30 FPS)'])
         self.speed_preset.currentIndexChanged.connect(self.apply_speed_preset)
         self.fps_label=QLabel('10.0 FPS')
-        self.total_duration_label=QLabel('3.00 seconds')
-        self.total_duration=QDoubleSpinBox();self.total_duration.setRange(0.5,15.0);self.total_duration.setDecimals(1);self.total_duration.setSingleStep(0.5);self.total_duration.setSuffix(' seconds');self.total_duration.setValue(3.0)
-        self.total_duration.valueChanged.connect(self.set_total_animation_duration)
-        self.duration_presets=QWidget();preset_row=QHBoxLayout(self.duration_presets);preset_row.setContentsMargins(0,0,0,0)
-        for seconds in (1,2,3,5,10):
-            button=QPushButton(f'{seconds}s');button.clicked.connect(lambda _checked=False,n=seconds:self.total_duration.setValue(n));preset_row.addWidget(button)
+        self.total_duration_label=QLabel('1.20 seconds')
         self.loop_count=QSpinBox();self.loop_count.setRange(0,1000);self.loop_count.setSpecialValueText('Forever');self.loop_count.setValue(0)
-        self.play_once=QCheckBox('Play once (instead of looping)')
-        self.play_once.toggled.connect(lambda checked:self.loop_count.setEnabled(not checked))
         self.export_format=QComboBox();self.export_format.addItems(['✨ Animated PNG / APNG (.png)','🎞 Animated GIF (.gif)','▦ Sprite sheet (.png) — frames side by side','🖼 Still image (.png) — NO ANIMATION'])
-        for label,control in [('Speed preset',self.speed_preset),('Frame count',self.frames),('Milliseconds / frame',self.duration),('Cycle length',self.total_duration),('Quick durations',self.duration_presets),('Effective speed',self.fps_label),('Total duration',self.total_duration_label),('Animation loops',self.loop_count),('Playback',self.play_once),('Export format',self.export_format)]:settings.addRow(label,control)
-        self.frames.valueChanged.connect(lambda _value:self.set_total_animation_duration(self.total_duration.value()))
+        for label,control in [('Speed preset',self.speed_preset),('Frame count',self.frames),('Milliseconds / frame',self.duration),('Effective speed',self.fps_label),('Total duration',self.total_duration_label),('Animation loops',self.loop_count),('Export format',self.export_format)]:settings.addRow(label,control)
+        self.frames.valueChanged.connect(self.update_duration_summary)
         self.duration.valueChanged.connect(self.update_duration_summary)
         self.update_duration_summary()
         self.advanced_layout.addWidget(self.export_settings)
@@ -705,7 +685,7 @@ class MainWindow(QMainWindow):
             'Frame Pencil':'Draw changes only on the currently selected animation frame.',
             'Frame Eraser':'Erase pixels only on the currently selected animation frame.'}
         for i in range(self.tool.count()):self.tool.setItemData(i,hints.get(self.tool.itemText(i),''),Qt.ItemDataRole.ToolTipRole)
-        self.tool.currentIndexChanged.connect(lambda _index:self.statusBar().showMessage(hints.get(self.tool.currentText(),''),7000))
+        self.tool.currentTextChanged.connect(lambda tool:self.statusBar().showMessage(hints.get(tool,''),7000))
         tips=[(self.animator_button,'Quick effects: highlight pixels, choose a preset, preview, and export.'),
               (self.advanced_animator_button,'Open the separate frame-by-frame timeline. Closing it keeps your work.'),
               (self.effect,'Choose an effect; use Preview animation to see it in motion.'),
@@ -718,10 +698,10 @@ class MainWindow(QMainWindow):
               (self.advanced_effects,'Optional settings for lasers, gush, and independent effect timing.'),
               (self.export_settings,'Optional animation duration, looping, and output format controls.')]
         for widget,tip in tips:widget.setToolTip(tip)
-        self.tool.setToolTip('M: Move, P: Pencil, B: Mask Brush, E: Eraser, I: Eyedropper; other shortcuts appear beside tool names.')
+        self.tool.setToolTip('Choose how the mouse interacts with the canvas. B: brush/pencil, E: eraser, I: eyedropper. B/E use the active drawing context.')
         self.layer_list.setToolTip('Select the artwork layer you want to edit.')
         self.setStatusTip('Tip: Import a PNG or create a blank layer to begin.')
-        for keys,fn in [('Ctrl+Z',self.undo),('Ctrl+Shift+Z',self.redo),('Ctrl+Y',self.redo),('I',self.activate_eyedropper),('M',lambda:self.tool.setCurrentText('Move / Transform')),('P',lambda:self.tool.setCurrentText('Pencil')),('B',lambda:self.tool.setCurrentText('Mask Brush')),('E',self.activate_universal_eraser),('1',lambda:self.tool.setCurrentText('Move Laser Asset')),('2',lambda:self.tool.setCurrentText('Spray Can')),('3',lambda:self.tool.setCurrentText('Paint Bucket')),('4',lambda:self.tool.setCurrentText('Animation Region')),('5',lambda:self.tool.setCurrentText('Mask Eraser')),('6',lambda:self.tool.setCurrentText('Frame Pencil')),('7',lambda:self.tool.setCurrentText('Frame Eraser')),('+',lambda:self.adjust_brush_size(1)),('=',lambda:self.adjust_brush_size(1)),('-',lambda:self.adjust_brush_size(-1)),('Ctrl+O',self.load_project),('Ctrl+S',self.save_project),('Ctrl+I',self.import_png),('Ctrl+E',self.export_choose_formats)]:
+        for keys,fn in [('Ctrl+Z',self.undo),('Ctrl+Shift+Z',self.redo),('Ctrl+Y',self.redo),('I',self.activate_eyedropper),('B',self.activate_universal_brush),('E',self.activate_universal_eraser),('+',lambda:self.adjust_brush_size(1)),('=',lambda:self.adjust_brush_size(1)),('-',lambda:self.adjust_brush_size(-1)),('Ctrl+O',self.load_project),('Ctrl+S',self.save_project),('Ctrl+I',self.import_png),('Ctrl+E',self.export_choose_formats)]:
             shortcut=QShortcut(QKeySequence(keys),self);shortcut.activated.connect(fn)
         # Keep native Delete behavior in editors by disabling the shortcut BEFORE
         # Qt's shortcut dispatch (returning from a callback would swallow the key).
@@ -876,12 +856,55 @@ class MainWindow(QMainWindow):
         if answer!=QMessageBox.StandardButton.Yes:return
         self.checkpoint()
         empty=capture(self.size_px,[],[],self.traits,{},
-                      self.frames.value(),self.duration.value(),self.export_loop_value(),
+                      self.frames.value(),self.duration.value(),self.loop_count.value(),
                       self.export_format.currentIndex())
         empty.update(pet_anchors={},pet_regions={},frame_tracks={'Ink':{}},
                      motion_keys={},layer_motion_keys={},frame_clips={})
         self.restore_snapshot(empty)
         self.statusBar().showMessage('Canvas cleared — Ctrl+Z to undo',4000)
+
+    def open_external_png(self, path):
+        """Open a PNG supplied by Friendly Animator as an editable single layer."""
+        target=Path(path).expanduser().resolve()
+        if not target.is_file() or target.suffix.lower() != '.png':
+            raise ValueError(f'Not a PNG file: {target}')
+        with Image.open(target) as source:
+            source.load()
+            if source.format != 'PNG':
+                raise ValueError('The supplied file is not a PNG image.')
+            rgba=source.convert('RGBA').copy()
+        if self._dirty:
+            raise RuntimeError('Save or close the current project before opening an external PNG.')
+        self.checkpoint()
+        self.size_px=rgba.size
+        self.layers=[Layer(target.name,rgba)]
+        self.regions=[];self.frame_edits={};self.frame_clips={}
+        self.frame_tracks={'Ink':{}};self.motion_keys={};self.layer_motion_keys={}
+        self.layer_list.clear();self.layer_list.addItem(target.name);self.layer_list.setCurrentRow(0)
+        self.external_png_path=target
+        self.external_save_button.setVisible(True)
+        self.external_save_button.setToolTip(f'Save canvas changes to {target}')
+        # Keep the size selector consistent, including nonstandard sprite sizes.
+        label=f'{rgba.width} × {rgba.height}'
+        self.sizes.blockSignals(True)
+        index=self.sizes.findText(label)
+        self.sizes.setCurrentIndex(index if index>=0 else self.sizes.findText('Custom…'))
+        self.sizes.blockSignals(False)
+        self.canvas.reset_zoom()
+        self.invalidate()
+        self.statusBar().showMessage(f'Opened PNG from Friendly Animator: {target}',6000)
+
+    def save_external_png(self):
+        """Explicitly save pixels to the linked PNG; never overwrite project JSON."""
+        if not self.external_png_path:
+            QMessageBox.information(self,'No linked PNG','Open a PNG from Friendly Animator first.')
+            return
+        target=Path(self.external_png_path)
+        try:
+            safe_export(str(target),lambda tmp:composite(self.layers,self.size_px).save(tmp,format='PNG'),self._validate_still_export)
+            self.statusBar().showMessage(f'Saved PNG for Friendly Animator: {target}',6000)
+        except Exception as exc:
+            QMessageBox.warning(self,'Save linked PNG failed',str(exc))
 
     def export_canvas_png(self):
         """One-click discoverable still PNG export, independent of project JSON."""
@@ -910,7 +933,7 @@ class MainWindow(QMainWindow):
                      layer_motion_keys={},frame_clips={})
         self.restore_snapshot(fresh)
         self.history=UndoHistory()
-        self.project_path=None;self._dirty=False
+        self.project_path=None;self._dirty=False;self.external_png_path=None;self.external_save_button.setVisible(False)
         # A fresh project supersedes the previous recovery only after reset succeeds.
         self.recovery_path.unlink(missing_ok=True)
         self.sizes.blockSignals(True);self.sizes.setCurrentIndex(1);self.sizes.blockSignals(False)
@@ -981,7 +1004,6 @@ class MainWindow(QMainWindow):
     def advanced_animator_visibility_changed(self,visible):
         self.advanced_animator_button.setText('🎞 Hide Intermediate Studio' if visible else '🎞 Open Intermediate Studio')
     def activate_tool(self,tool):
-        tool=self.tool.currentText()
         # This also handles selecting Eyedropper directly from the dropdown.
         if tool=='Eyedropper':
             previous=getattr(self,'_last_selected_tool','Pencil')
@@ -1358,24 +1380,8 @@ class MainWindow(QMainWindow):
     def apply_speed_preset(self,index):
         values={1:200,2:100,3:67,4:42,5:33}
         if index in values:self.duration.setValue(values[index])
-    def export_loop_value(self):
-        return 1 if self.play_once.isChecked() else self.loop_count.value()
-
-    def set_total_animation_duration(self,seconds):
-        # Pillow's GIF encoder uses 10 ms granularity. Keep GIF and APNG in sync.
-        required_frames=math.ceil(seconds*1000/2000)
-        if self.frames.value()<required_frames:
-            self.frames.blockSignals(True)
-            self.frames.setValue(required_frames)
-            self.frames.blockSignals(False)
-        frame_ms=max(20,min(2000,round(seconds*1000/self.frames.value()/10)*10))
-        self.duration.setValue(frame_ms)
-
     def update_duration_summary(self,*args):
         ms=self.duration.value();count=self.frames.value()
-        self.total_duration.blockSignals(True)
-        self.total_duration.setValue(count*ms/1000)
-        self.total_duration.blockSignals(False)
         self.fps_label.setText(f'{1000/ms:.1f} FPS')
         self.total_duration_label.setText(f'{count*ms/1000:.2f} seconds ({count} frames)')
     def update_export_tip(self,*args):
@@ -1440,8 +1446,8 @@ class MainWindow(QMainWindow):
         saved=[]
         errors=[]
         operations=[
-            (selected[0],output/(name+'_animated.apng'),lambda path:export_apng(frames,path,self.duration.value(),self.export_loop_value())),
-            (selected[1],output/(name+'_animated.gif'),lambda path:export_gif(frames,path,self.duration.value(),self.export_loop_value())),
+            (selected[0],output/(name+'_animated.apng'),lambda path:export_apng(frames,path,self.duration.value(),self.loop_count.value())),
+            (selected[1],output/(name+'_animated.gif'),lambda path:export_gif(frames,path,self.duration.value(),self.loop_count.value())),
             (selected[2],output/(name+'_still.png'),lambda path:composite(self.layers,self.size_px).save(path)),
         ]
         for enabled,path,write in operations:
@@ -1481,7 +1487,7 @@ class MainWindow(QMainWindow):
         if not path.lower().endswith('.gif'):path+='.gif'
         try:
             frames=self.make_frames()
-            safe_export(path,lambda tmp:export_gif(frames,tmp,self.duration.value(),self.export_loop_value()),self._validate_animated_export)
+            safe_export(path,lambda tmp:export_gif(frames,tmp,self.duration.value(),self.loop_count.value()),self._validate_animated_export)
             QMessageBox.information(self,'Moving GIF exported',f'Animated GIF saved to {path}\nOpen in a browser to see it move.')
         except Exception as e:QMessageBox.warning(self,'GIF export failed',str(e))
 
@@ -1505,7 +1511,7 @@ class MainWindow(QMainWindow):
             if not path.lower().endswith(('.apng','.png')):path+='.apng'
             try:
                 frames=self.make_frames()
-                safe_export(path,lambda tmp:export_apng(frames,tmp,self.duration.value(),self.export_loop_value()),self._validate_animated_export)
+                safe_export(path,lambda tmp:export_apng(frames,tmp,self.duration.value(),self.loop_count.value()),self._validate_animated_export)
                 QMessageBox.information(self,'Moving APNG exported',f'Animated PNG saved to {path}\nThis is an animated PNG (APNG). Open in an APNG-compatible viewer or browser to see it move.')
             except Exception as e:QMessageBox.warning(self,'Animation export',str(e))
     def save_png(self):
@@ -1594,8 +1600,7 @@ class MainWindow(QMainWindow):
         except Exception as e:QMessageBox.warning(self,'Generation failed',str(e))
     def snapshot(self):
         obj=capture(self.size_px,self.layers,self.regions,self.traits,self.frame_edits,
-                    self.frames.value(),self.duration.value(),self.export_loop_value(),self.export_format.currentIndex())
-        obj['play_once']=self.play_once.isChecked()
+                    self.frames.value(),self.duration.value(),self.loop_count.value(),self.export_format.currentIndex())
         obj['pet_anchors']=json.loads(json.dumps(self.pet_anchors))
         obj['pet_regions']=json.loads(json.dumps(self.pet_regions))
         obj['frame_tracks']=json.loads(json.dumps(self.frame_tracks))
@@ -1622,8 +1627,8 @@ class MainWindow(QMainWindow):
             self.clip_selector.clear();self.clip_selector.addItems(list(self.frame_clips))
             self.track_selector.blockSignals(True);self.track_selector.clear();self.track_selector.addItems(list(self.frame_tracks));self.track_selector.blockSignals(False)
             self.sync_frame_edits();self.refresh_motion_summary();self.refresh_layer_motion()
-            self.frames.setValue(obj.get('frame_count',12));self.duration.setValue(obj.get('frame_duration',250))
-            self.loop_count.setValue(obj.get('animation_loops',0));self.play_once.setChecked(obj.get('play_once',False));self.export_format.setCurrentIndex(obj.get('export_format',0))
+            self.frames.setValue(obj.get('frame_count',8));self.duration.setValue(obj.get('frame_duration',100))
+            self.loop_count.setValue(obj.get('animation_loops',0));self.export_format.setCurrentIndex(obj.get('export_format',0))
             self.timeline_mode=bool(self.frame_edits)
             # Snapshot restore replaces model objects. Do not emit selection
             # callbacks while the associated Qt list items are being destroyed.
@@ -1749,5 +1754,11 @@ def main():
     app.setApplicationName('Slime House Studios')
     app.setWindowIcon(QIcon(str(resource_path('assets/slime_mascot.png'))))
     win=MainWindow()
+    if len(sys.argv)>1:
+        try:
+            win.open_external_png(sys.argv[1])
+        except Exception as exc:
+            logging.getLogger('slimehouse').exception('Failed to open startup PNG')
+            QMessageBox.warning(win,'Could not open PNG',str(exc))
     win.show()
     sys.exit(app.exec())

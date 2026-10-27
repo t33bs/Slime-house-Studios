@@ -284,8 +284,7 @@ def export_gif(frames, filename, duration=100, loop=0):
         out.info['transparency'] = 0
         indexed.append(out)
     indexed[0].save(filename, format='GIF', save_all=True, append_images=indexed[1:],
-                    duration=[duration] * len(indexed),
-                    **({} if loop == 1 else {'loop': loop}),
+                    duration=[duration] * len(indexed), loop=loop,
                     disposal=2, transparency=0, optimize=False)
     with Image.open(filename) as im:
         if im.n_frames < 2:

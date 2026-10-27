@@ -2,7 +2,7 @@ from pathlib import Path
 
 def test_universal_shortcuts_are_registered():
     source=(Path(__file__).resolve().parents[1]/'studio'/'app.py').read_text(encoding='utf-8')
-    assert "('B',lambda:self.tool.setCurrentText('Mask Brush'))" in source
+    assert "('B',self.activate_universal_brush)" in source
     assert "('E',self.activate_universal_eraser)" in source
     assert "('I',self.activate_eyedropper)" in source
 

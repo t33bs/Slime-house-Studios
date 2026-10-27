@@ -5,7 +5,7 @@ APP = Path(__file__).resolve().parents[1] / 'studio' / 'app.py'
 
 def test_shortcuts_and_size_controls_exist():
     src = APP.read_text(encoding='utf-8')
-    assert "('B',lambda:self.tool.setCurrentText('Mask Brush'))" in src
+    assert "('B',self.activate_universal_brush)" in src
     assert "('E',self.activate_universal_eraser)" in src
     assert "('I',self.activate_eyedropper)" in src
     assert "('+',lambda:self.adjust_brush_size(1))" in src
