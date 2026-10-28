@@ -882,6 +882,10 @@ class MainWindow(QMainWindow):
         self.frame_tracks={'Ink':{}};self.motion_keys={};self.layer_motion_keys={}
         self.layer_list.clear();self.layer_list.addItem(target.name);self.layer_list.setCurrentRow(0)
         self.external_png_path=target
+        # Loading a linked PNG is not an unsaved edit. checkpoint() records the
+        # previous document for Undo but marks the document dirty; clear that
+        # flag once the new image has been loaded successfully.
+        self._dirty=False
         self.external_save_button.setVisible(True)
         self.external_save_button.setToolTip(f'Save canvas changes to {target}')
         # Keep the size selector consistent, including nonstandard sprite sizes.
@@ -902,6 +906,7 @@ class MainWindow(QMainWindow):
         target=Path(self.external_png_path)
         try:
             safe_export(str(target),lambda tmp:composite(self.layers,self.size_px).save(tmp,format='PNG'),self._validate_still_export)
+            self._dirty=False
             self.statusBar().showMessage(f'Saved PNG for Friendly Animator: {target}',6000)
         except Exception as exc:
             QMessageBox.warning(self,'Save linked PNG failed',str(exc))
